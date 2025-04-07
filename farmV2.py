@@ -465,13 +465,11 @@ def focus_discord():
     return False
 
 while True:
-    click_bouquet_then_best()
-    break
     focus_discord()
     pyautogui.write("sd")
     pyautogui.press("enter")
-    time.sleep(6)
-    click_lowest_or_first_card()
+    time.sleep(4)
+    click_bouquet_then_best()
     sleep_duration = random.randint(480, 500)
     logging.info(f"Sleeping for {sleep_duration} seconds before the next action.")
     time.sleep(sleep_duration)
