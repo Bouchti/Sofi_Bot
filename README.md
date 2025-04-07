@@ -15,7 +15,7 @@
 
 - 🔁 **Automated Farming** – Sends sd command at set intervals
 - 👡 **Mouse Simulation** – Simulates real mouse clicks using `pyautogui`
-- 🧠 **Smart Claiming** – Detects and claims cards quickly based on visual cues
+- 🧠 **Smart Claiming** – Detects and claims cards quickly based on visual cues and a predefined list of best cards.
 - 🖼️ **Image Matching** – Uses template matching for detecting buttons and cards
 - 🔧 **Customizable** – Modify timings, detection logic, and image templates to suit your needs
 
