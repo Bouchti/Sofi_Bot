@@ -476,8 +476,6 @@ def focus_discord():
     return False
 
 while True:
-    click_bouquet_then_best()
-    break
     focus_discord()
     pyautogui.write("sd")
     pyautogui.press("enter")
