@@ -62,7 +62,7 @@
 3. 🛠️ **Run the Bot**
 
    ```bash
-   python farm.py
+   python farmV2.py
    ```
 
 > ⚠️ This bot simulates user behavior. Use responsibly and at your own risk, in accordance with Discord's Terms of Service.
