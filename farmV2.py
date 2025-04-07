@@ -27,7 +27,7 @@ CARD_DROP_HEIGHT = 165
 CLAIM_BUTTON_TEMPLATE_PATH = "claim_button.png"
 CLAIM_BUTTON_TEMPLATE = cv2.imread(CLAIM_BUTTON_TEMPLATE_PATH, cv2.IMREAD_UNCHANGED)
 # Load templates for bouquet detection
-bouquet_card_template = cv2.imread("bouquet_card.png", cv2.IMREAD_UNCHANGED)
+bouquet_card_template = cv2.imread("bouquet_icon_template.png", cv2.IMREAD_UNCHANGED)
 bouquet_button_template = cv2.imread("bouquet_button.png", cv2.IMREAD_UNCHANGED)
 
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
@@ -35,35 +35,46 @@ pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 # Logging configuration
 # Logging configuration
 logging.basicConfig(level=logging.DEBUG)  # Set to WARNING to reduce log output
+def capture_cards_only():
+    with mss.mss() as sct:
+        region = {
+            "left": CARD_DROP_X,
+            "top": CARD_DROP_Y-200,
+            "width": CARD_DROP_WIDTH,
+            "height": CARD_DROP_HEIGHT+130
+        }
+        screenshot = sct.grab(region)
+        img = Image.frombytes("RGB", screenshot.size, screenshot.rgb)
+        img.save(f"cards_only.png")
+        return img
 
+# Ensure the bouquet card template is loaded correctly
+if bouquet_card_template is None:
+    logging.error("❌ Bouquet card template not found or failed to load.")
+else:
+    # Convert the template to grayscale
+    bouquet_card_template = cv2.cvtColor(bouquet_card_template, cv2.COLOR_BGR2GRAY)
 
 # Function to detect bouquet card and return its index (0, 1, 2)
 def detect_bouquet_card(screenshot):
     screenshot_np = np.array(screenshot)
     card_width = CARD_DROP_WIDTH // 3
-    card_height = CARD_DROP_HEIGHT
+    card_height = CARD_DROP_HEIGHT + 130
     matches = []
 
+    # Convert the screenshot to grayscale
+    screenshot_gray = cv2.cvtColor(screenshot_np, cv2.COLOR_BGR2GRAY)
+
     for i in range(3):
-        left = i * card_width
-        right = left + card_width
-        card_img = screenshot_np[0:card_height, left:right]
-        card_gray = cv2.cvtColor(card_img, cv2.COLOR_BGR2GRAY)
+        left = i * card_width 
+        right = left + card_width 
+        card_img = screenshot_gray[0:card_height, left:right]
 
-        # Resize the template to match the approximate card size
-        bouquet_gray = cv2.cvtColor(bouquet_card_template, cv2.COLOR_BGR2GRAY)
-        scale_factor = 0.5  # Adjust as needed
-        resized_template = cv2.resize(bouquet_gray, (0, 0), fx=scale_factor, fy=scale_factor)
-
-        # Skip if template is still bigger than the card
-        if resized_template.shape[0] > card_gray.shape[0] or resized_template.shape[1] > card_gray.shape[1]:
-            logging.warning(f"⚠️ Resized bouquet template still too big for card {i+1}. Skipping.")
-            continue
-
-        res = cv2.matchTemplate(card_gray, resized_template, cv2.TM_CCOEFF_NORMED)
+        # Perform template matching
+        res = cv2.matchTemplate(card_img, bouquet_card_template, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, _ = cv2.minMaxLoc(res)
         logging.debug(f"🔍 Bouquet match value for card {i+1}: {max_val}")
-        if max_val > 0.6:
+        if max_val > 0.9:
             matches.append((i, max_val))
 
     if matches:
@@ -86,7 +97,7 @@ def click_bouquet_button(card_index, buttons):
 
 def click_bouquet_then_best():
     logging.info("\n🔍 Starting smart claim process...")
-    screenshot = capture_discord_message()
+    screenshot = capture_cards_only()
     buttons = find_buttons()
     bouquet_card_index = detect_bouquet_card(screenshot)
 
@@ -108,7 +119,7 @@ def click_bouquet_then_best():
     for i in remaining_indices:
         left = i * card_width
         right = left + card_width
-        card_image = screenshot.crop((left, 0, right, CARD_DROP_HEIGHT))
+        card_image = screenshot.crop((left, 0, right, CARD_DROP_HEIGHT+130))
         names = extract_card_names(np.array(card_image))
         matches = find_best_character_match(names)
 
@@ -333,7 +344,7 @@ def extract_card_generations(image):
     for i in range(3):
         left = i * card_width
         right = left + card_width
-        card_image = image.crop((left, 0, right, CARD_DROP_HEIGHT))
+        card_image = image.crop((left, 0, right, CARD_DROP_HEIGHT+130))
         card_image.save(f"card_{i}.png")
 
         # Preprocess the image in memory
@@ -465,6 +476,8 @@ def focus_discord():
     return False
 
 while True:
+    click_bouquet_then_best()
+    break
     focus_discord()
     pyautogui.write("sd")
     pyautogui.press("enter")
