@@ -26,12 +26,122 @@ CARD_DROP_WIDTH = 600
 CARD_DROP_HEIGHT = 165
 CLAIM_BUTTON_TEMPLATE_PATH = "claim_button.png"
 CLAIM_BUTTON_TEMPLATE = cv2.imread(CLAIM_BUTTON_TEMPLATE_PATH, cv2.IMREAD_UNCHANGED)
+# Load templates for bouquet detection
+bouquet_card_template = cv2.imread("bouquet_card.png", cv2.IMREAD_UNCHANGED)
+bouquet_button_template = cv2.imread("bouquet_button.png", cv2.IMREAD_UNCHANGED)
 
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
 # Logging configuration
 # Logging configuration
 logging.basicConfig(level=logging.DEBUG)  # Set to WARNING to reduce log output
+
+
+# Function to detect bouquet card and return its index (0, 1, 2)
+def detect_bouquet_card(screenshot):
+    screenshot_np = np.array(screenshot)
+    card_width = CARD_DROP_WIDTH // 3
+    card_height = CARD_DROP_HEIGHT
+    matches = []
+
+    for i in range(3):
+        left = i * card_width
+        right = left + card_width
+        card_img = screenshot_np[0:card_height, left:right]
+        card_gray = cv2.cvtColor(card_img, cv2.COLOR_BGR2GRAY)
+
+        # Resize the template to match the approximate card size
+        bouquet_gray = cv2.cvtColor(bouquet_card_template, cv2.COLOR_BGR2GRAY)
+        scale_factor = 0.5  # Adjust as needed
+        resized_template = cv2.resize(bouquet_gray, (0, 0), fx=scale_factor, fy=scale_factor)
+
+        # Skip if template is still bigger than the card
+        if resized_template.shape[0] > card_gray.shape[0] or resized_template.shape[1] > card_gray.shape[1]:
+            logging.warning(f"⚠️ Resized bouquet template still too big for card {i+1}. Skipping.")
+            continue
+
+        res = cv2.matchTemplate(card_gray, resized_template, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, _ = cv2.minMaxLoc(res)
+        logging.debug(f"🔍 Bouquet match value for card {i+1}: {max_val}")
+        if max_val > 0.6:
+            matches.append((i, max_val))
+
+    if matches:
+        best_match = max(matches, key=lambda x: x[1])
+        logging.info(f"💐 Bouquet card detected at position {best_match[0] + 1} with confidence {best_match[1]:.2f}")
+        return best_match[0]
+    return None
+
+# Function to click bouquet button
+def click_bouquet_button(card_index, buttons):
+    button_x, button_y = buttons[card_index]
+    button_center_x = button_x + 40
+    button_center_y = button_y + 15 
+    logging.info(f"🌹 Clicking bouquet card button at position: {buttons[card_index]}")
+    pyautogui.moveTo(button_center_x, button_center_y, duration=0.2)
+    time.sleep(1)
+    pyautogui.click()
+    logging.info("✅ Bouquet claimed successfully.")
+
+
+def click_bouquet_then_best():
+    logging.info("\n🔍 Starting smart claim process...")
+    screenshot = capture_discord_message()
+    buttons = find_buttons()
+    bouquet_card_index = detect_bouquet_card(screenshot)
+
+    if bouquet_card_index is not None:
+        click_bouquet_button(bouquet_card_index, buttons)
+        time.sleep(2)  # Small delay to ensure bouquet is claimed
+
+    remaining_indices = [i for i in range(3) if i != bouquet_card_index]
+
+    # Extract generations and remove bouquet card from gen dictionary
+    card_gens = extract_card_generations(screenshot)
+    card_gens = {k: v for k, v in card_gens.items() if k in remaining_indices}
+
+    best_match_index = None
+    best_rank = float('inf')
+    no_gen_card_index = None
+    card_width = CARD_DROP_WIDTH // 3
+
+    for i in remaining_indices:
+        left = i * card_width
+        right = left + card_width
+        card_image = screenshot.crop((left, 0, right, CARD_DROP_HEIGHT))
+        names = extract_card_names(np.array(card_image))
+        matches = find_best_character_match(names)
+
+        for _, match_name, score, rank in matches:
+            if score >= 95 and rank < best_rank:
+                best_rank = rank
+                best_match_index = i
+
+        if i not in card_gens and no_gen_card_index is None:
+            no_gen_card_index = i
+
+    # Decide which card to click
+    if no_gen_card_index is not None:
+        button_index = no_gen_card_index
+    elif best_match_index is not None:
+        button_index = best_match_index
+    elif card_gens:
+        flattened_gens = [(index, gen) for index, gens in card_gens.items() for gen in gens.items()]
+        sorted_card_gens = sorted(flattened_gens, key=lambda x: x[1][1])
+        button_index = sorted_card_gens[0][0] if sorted_card_gens else remaining_indices[0]
+    else:
+        button_index = remaining_indices[0]  # fallback
+
+    # Final click
+    button_x, button_y = buttons[button_index]
+    button_center_x = button_x + 40
+    button_center_y = button_y + 15 
+    logging.info(f"🎯 Clicking best card at position {button_index + 1}: ({button_center_x}, {button_center_y})")
+    pyautogui.moveTo(button_center_x, button_center_y, duration=0.2)
+    time.sleep(1)
+    pyautogui.click()
+    logging.info(f"✅ Claimed secondary card (index {button_index + 1})")
+
 
 def preprocess_string(s):
     tokens = re.sub(r'[^a-zA-Z0-9]', ' ', s).upper().split()
@@ -355,10 +465,12 @@ def focus_discord():
     return False
 
 while True:
+    click_bouquet_then_best()
+    break
     focus_discord()
     pyautogui.write("sd")
     pyautogui.press("enter")
-    time.sleep(4)
+    time.sleep(6)
     click_lowest_or_first_card()
     sleep_duration = random.randint(480, 500)
     logging.info(f"Sleeping for {sleep_duration} seconds before the next action.")
