@@ -5,3 +5,4 @@ pillow
 pygetwindow
 pyscreeze
 pymsgbox
+python-dotenv
