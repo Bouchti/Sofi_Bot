@@ -1,0 +1,7 @@
+opencv-python
+pyautogui
+numpy
+pillow
+pygetwindow
+pyscreeze
+pymsgbox
