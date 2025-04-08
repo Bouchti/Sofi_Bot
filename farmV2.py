@@ -14,7 +14,7 @@ from io import BytesIO
 import requests
 from bs4 import BeautifulSoup
 from rapidfuzz import fuzz, process
-
+import threading
 # Configuration
 TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 with mss.mss() as sct:
@@ -33,8 +33,9 @@ bouquet_button_template = cv2.imread("bouquet_button.png", cv2.IMREAD_UNCHANGED)
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
 # Logging configuration
-# Logging configuration
 logging.basicConfig(level=logging.DEBUG)  # Set to WARNING to reduce log output
+
+
 def capture_cards_only():
     with mss.mss() as sct:
         region = {
@@ -58,22 +59,31 @@ else:
 # Function to detect bouquet card and return its index (0, 1, 2)
 def detect_bouquet_card(screenshot):
     screenshot_np = np.array(screenshot)
-    card_width = CARD_DROP_WIDTH // 3
-    card_height = CARD_DROP_HEIGHT + 130
+    img_height, img_width = screenshot_np.shape[:2]
+
+    # Dynamically compute card dimensions
+    card_width = img_width // 3
+    card_height = img_height  # Use full height
+
+    # Convert to grayscale for template matching
+    screenshot_gray = cv2.cvtColor(screenshot_np, cv2.COLOR_BGR2GRAY)
     matches = []
 
-    # Convert the screenshot to grayscale
-    screenshot_gray = cv2.cvtColor(screenshot_np, cv2.COLOR_BGR2GRAY)
-
     for i in range(3):
-        left = i * card_width 
-        right = left + card_width 
+        left = i * card_width
+        right = left + card_width
+
+        # Crop the individual card region
         card_img = screenshot_gray[0:card_height, left:right]
+
+        # Slightly pad around the region (optional)
+        # card_img = cv2.copyMakeBorder(card_img, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=255)
 
         # Perform template matching
         res = cv2.matchTemplate(card_img, bouquet_card_template, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, _ = cv2.minMaxLoc(res)
         logging.debug(f"🔍 Bouquet match value for card {i+1}: {max_val}")
+
         if max_val > 0.9:
             matches.append((i, max_val))
 
@@ -81,6 +91,7 @@ def detect_bouquet_card(screenshot):
         best_match = max(matches, key=lambda x: x[1])
         logging.info(f"💐 Bouquet card detected at position {best_match[0] + 1} with confidence {best_match[1]:.2f}")
         return best_match[0]
+
     return None
 
 # Function to click bouquet button
@@ -103,7 +114,6 @@ def click_bouquet_then_best():
 
     if bouquet_card_index is not None:
         click_bouquet_button(bouquet_card_index, buttons)
-        time.sleep(2)  # Small delay to ensure bouquet is claimed
 
     remaining_indices = [i for i in range(3) if i != bouquet_card_index]
 
@@ -337,25 +347,30 @@ def extract_generation_with_easyocr(image):
     return generations
 
 def extract_card_generations(image):
-    """Extracts generation numbers for each card by cropping the image into three sections."""
-    card_width = CARD_DROP_WIDTH // 3
+    """
+    Extracts generation numbers for each card by cropping the image into three equal vertical sections.
+    Returns a dictionary {card_index: extracted_generations_dict}
+    """
+    card_width = image.width // 3
     card_generations = {}
 
     for i in range(3):
         left = i * card_width
         right = left + card_width
-        card_image = image.crop((left, 0, right, CARD_DROP_HEIGHT+130))
-        card_image.save(f"card_{i}.png")
+        card_crop = image.crop((left, 0, right, image.height))
+        card_crop.save(f"card_{i}.png")  # Optional debug save
 
-        # Preprocess the image in memory
-        processed_image = preprocess_image(card_image)
+        # Preprocess the card before OCR
+        processed_image = preprocess_image(card_crop)
         extracted_numbers = extract_generation_with_easyocr(processed_image)
 
         if extracted_numbers:
             card_generations[i] = extracted_numbers
+            logging.debug(f"✅ Gen for card {i}: {extracted_numbers}")
         else:
-            logging.debug(f"❌ No valid generation numbers found for card {i+1}.")
+            logging.debug(f"❌ No valid generation numbers found for card {i}.")
 
+    logging.info(f"🚀 FINAL NORMALIZED GENERATIONS: {card_generations}")
     return card_generations
 
 def find_buttons():
@@ -474,13 +489,3 @@ def focus_discord():
     except Exception as e:
         logging.error(f"Error focusing Discord: {e}")
     return False
-
-while True:
-    focus_discord()
-    pyautogui.write("sd")
-    pyautogui.press("enter")
-    time.sleep(4)
-    click_bouquet_then_best()
-    sleep_duration = random.randint(480, 500)
-    logging.info(f"Sleeping for {sleep_duration} seconds before the next action.")
-    time.sleep(sleep_duration)
