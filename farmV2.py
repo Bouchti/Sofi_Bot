@@ -103,7 +103,6 @@ def click_bouquet_then_best():
 
     if bouquet_card_index is not None:
         click_bouquet_button(bouquet_card_index, buttons)
-        time.sleep(2)  # Small delay to ensure bouquet is claimed
 
     remaining_indices = [i for i in range(3) if i != bouquet_card_index]
 
