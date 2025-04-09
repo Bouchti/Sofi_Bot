@@ -24,7 +24,7 @@ CHANNEL_ID = os.getenv("CHANNEL_ID")
 USER_ID = os.getenv("USER_ID")
 
 # Initialize logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logging.getLogger("websocket").setLevel(logging.CRITICAL)
 logging.getLogger("discum.gateway.gateway").setLevel(logging.ERROR)
 
@@ -167,7 +167,7 @@ def extract_generation_with_easyocr(image):
     generations = clean_generation_text(extracted_text)
     card_names = extract_card_names_from_ocr_results(extracted_text)
     time_taken = time.time() - start_time
-    logging.info(f"⏱️ Time taken for extract_generation_with_easyocr: {time_taken:.2f} seconds")
+    logging.debug(f"⏱️ Time taken for extract_generation_with_easyocr: {time_taken:.2f} seconds")
     
     # Handle empty results
     if not generations and not card_names:
@@ -199,7 +199,7 @@ def extract_card_generations(image):
             else:
                 logging.debug(f"❌ No valid data for card {i}")
 
-    logging.info(f"🚀 FINAL CARD INFO: {card_info}")
+    logging.debug(f"🚀 FINAL CARD INFO: {card_info}")
     return card_info
 
 def find_best_character_match(card_names):
@@ -215,25 +215,22 @@ def find_best_character_match(card_names):
             )
             if best_match:
                 match_name, score = best_match[0], best_match[1]
-                if score >= 85:                  
+                if score >= 95:                  
                     rank = TOP_CHARACTERS_LIST.index(match_name)
-                    logging.debug(f"🔍 Match found: {name} -> {match_name} with score {score} and rank {rank}")
+                    logging.info(f"⭐ Match found: {name} -> {match_name} with score {score} and rank {rank}")
                     matches.append((name, match_name, score, rank))
                 else:
-                    logging.info(f"⚠️ Low score match: {name} -> {match_name} with score {score}")
+                    logging.debug(f"⚠️ Low score match: {name} -> {match_name} with score {score}")
             else:
                 logging.info(f"❌ No match found for: {name}")
         except Exception as e:
             logging.error(f"Error matching {name}: {e}")
     return matches
 
-def click_bouquet_then_best_from_image(pil_image, buttons_components):
+def click_bouquet_then_best_from_image(pil_image, buttons_components, image_received_time):
     """Process the Sofi card image and click the appropriate buttons for cards without generation numbers."""
     logging.info("🧠 Starting processing of the Sofi card image...")
-
     card_count = 3
-    card_width = pil_image.width // card_count
-
     button_ids = [btn["custom_id"] for component_row in buttons_components for btn in component_row.get("components", []) if btn["type"] == 2 and btn["style"] in (1, 2)]
 
     if len(button_ids) != 3:
@@ -250,8 +247,15 @@ def click_bouquet_then_best_from_image(pil_image, buttons_components):
         generations = card_info.get(i, {}).get('generations', {})
         if not generations:
             click_discord_button(button_ids[i])
-            time.sleep(1)
-            logging.info(f"✅ Claimed card at index {i} (no generation number)")
+            # Record the time when the card is claimed
+            card_claimed_time = time.time()
+        
+        # Calculate the elapsed time
+            elapsed_time = card_claimed_time - image_received_time
+            logging.info(f"⏱️ Time from image received to card claimed: {elapsed_time:.2f} seconds")
+            # you can reduce this sleep but sofi bot can ignore your next clicks
+            time.sleep(3)
+            logging.info(f"✅ Claimed card {i+1} (no generation number)")
             claimed_indexes.append(i)
 
     # Loop only over remaining unclaimed cards
@@ -293,7 +297,16 @@ def click_bouquet_then_best_from_image(pil_image, buttons_components):
 
     if chosen_index is not None:
         click_discord_button(button_ids[chosen_index])
-        logging.info(f"✅ Claimed card at index {chosen_index} (best match or lowest generation)")
+        if best_match_index is not None:
+            logging.info(f"✅ Claimed card {chosen_index+1} (⭐best match⭐)")
+        else:
+            logging.info(f"✅ Claimed card {chosen_index+1} (🥱lowest generation🥱)")
+        # Record the time when the card is claimed
+        card_claimed_time = time.time()
+        
+        # Calculate the elapsed time
+        elapsed_time = card_claimed_time - image_received_time
+        logging.info(f"⏱️ Time from image received to card claimed: {elapsed_time:.2f} seconds")
     else:
         logging.warning("⚠️ No card was chosen to be claimed.")
 
@@ -313,7 +326,7 @@ def keep_alive(bot):
 
             if latency is None or latency == previous_latency:
                 failure_count += 1
-                logging.warning(f"⚠️ Latency unchanged or missing ({failure_count}x).")
+                logging.debug(f"⚠️ Latency unchanged or missing ({failure_count}x).")
             else:
                 failure_count = 0  # Reset on healthy update
 
@@ -349,10 +362,13 @@ def on_message(resp):
             filename = attachment.get('filename', '')
             if any(filename.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]):
                 try:
-                    logging.info(f"📥 Found image attachment: {filename}")
+                    logging.debug(f"📥 Found image attachment: {filename}")
                     response = session.get(attachment.get('url'))
                     image = Image.open(BytesIO(response.content)).convert("RGB")
-                    click_bouquet_then_best_from_image(image, components)
+                     # Record the time when the image is received
+                    image_received_time = time.time()
+                    # Pass the image_received_time to the function
+                    click_bouquet_then_best_from_image(image, components, image_received_time)
                 except Exception as e:
                     logging.warning(f"⚠️ Failed to process image: {e}")
                 return
