@@ -15,7 +15,7 @@ import re
 import threading
 import signal
 import sys
-
+from concurrent.futures import ThreadPoolExecutor
 # Load environment variables
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -24,7 +24,7 @@ CHANNEL_ID = os.getenv("CHANNEL_ID")
 USER_ID = os.getenv("USER_ID")
 
 # Initialize logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logging.getLogger("websocket").setLevel(logging.CRITICAL)
 logging.getLogger("discum.gateway.gateway").setLevel(logging.ERROR)
 
@@ -102,32 +102,23 @@ def preprocess_image(image):
     return image  # nothing else
 
 def extract_card_names_from_ocr_results(ocr_results):
-    """Extract valid card names from OCR results by filtering out generations and irrelevant text."""
+    """Extract card name from OCR results if index 0 becomes a valid generation after processing."""
     logging.debug(f"🔍 Raw OCR Results: {ocr_results}")
 
-    def is_valid_name(text):
-        if not isinstance(text, str):
-            return False
-        text = text.strip()
-        if not re.search(r'[A-Za-z]', text):  # Must contain letters
-            return False
-        if re.match(r'^G\d{2,4}$', text):     # Skip generation codes
-            return False
-        if re.match(r'^\d+$', text):          # Skip pure numbers
-            return False        
-        return True
-
-  # Filter all valid-looking names
-    filtered = [t.strip() for t in ocr_results if is_valid_name(t)]
-
-    if not filtered:
-        logging.warning("⚠️ No valid card name found in OCR results.")
+    if len(ocr_results) < 2:
+        logging.warning("⚠️ Not enough OCR results to extract name.")
         return []
 
-    # Return the first valid name only
-    best_name = filtered[0]
-    logging.debug(f"🧹 Card Name: {best_name}")
-    return [best_name]
+    # Try to clean and validate index 0 as a generation
+    processed_gen = clean_generation_text([ocr_results[0]])
+    if not processed_gen:
+        logging.warning("⚠️ Index 0 is not a valid generation after processing.")
+        return []
+
+    # If generation is valid, assume index 1 is the name
+    card_name = ocr_results[1].strip()
+    logging.debug(f"🧹 Card Name: {card_name}")
+    return [card_name]
 
 def clean_generation_text(ocr_results):
     """Clean and normalize generation text extracted from OCR."""
@@ -162,16 +153,14 @@ def extract_generation_with_easyocr(image):
         image = np.array(image)
 
     start_time = time.time()
-    if not hasattr(extract_generation_with_easyocr, "reader"):
-        extract_generation_with_easyocr.reader = easyocr.Reader(['en'], gpu=True)
-    max_width = 800
-    if image.shape[1] > max_width:
-        scale_ratio = max_width / image.shape[1]
-        image = cv2.resize(image, (max_width, int(image.shape[0] * scale_ratio)), interpolation=cv2.INTER_AREA)
+    target_width = 400
+    scale_ratio = target_width / image.shape[1]
+    image = cv2.resize(image, (target_width, int(image.shape[0] * scale_ratio)), interpolation=cv2.INTER_AREA)
     if len(image.shape) == 2 or image.shape[2] == 1:
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-    image = cv2.fastNlMeansDenoisingColored(image, None, 10, 10, 7, 21)
-    extracted_text = extract_generation_with_easyocr.reader.readtext(image, detail=0)
+    if np.std(image) < 50:  # low contrast image    
+        image = cv2.fastNlMeansDenoisingColored(image, None, 10, 10, 7, 21)
+    extracted_text = reader.readtext(image, detail=0)
     logging.debug(f"🔍 EasyOCR Raw Extracted: {extracted_text}")
 
     # Extract generations and card names
@@ -186,24 +175,30 @@ def extract_generation_with_easyocr(image):
     
     return generations, card_names
 
+def extract_card_for_index(index, card_crop):
+    processed = preprocess_image(card_crop)
+    return index, extract_generation_with_easyocr(processed)
+
 def extract_card_generations(image):
-    """Extract generation numbers and card names for each card by cropping the image into three equal vertical sections."""
     card_width = image.width // 3
     card_info = {}
-    for i in range(3):
-        left = i * card_width
-        right = left + card_width
-        card_crop = image.crop((left, 0, right, image.height))
-        processed_image = preprocess_image(card_crop)
-        extracted_generations, card_names = extract_generation_with_easyocr(processed_image)
-        if extracted_generations or card_names:
-            card_info[i] = {
-                'generations': extracted_generations,
-                'names': card_names
-            }
-            logging.debug(f"✅ Card {i}: Generations: {extracted_generations}, Names: {card_names}")
-        else:
-            logging.debug(f"❌ No valid generation numbers or card names found for card {i}.")
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = []
+        for i in range(3):
+            left = i * card_width
+            right = left + card_width
+            crop = image.crop((left, 0, right, image.height))
+            futures.append(executor.submit(extract_card_for_index, i, crop))
+
+        for future in futures:
+            i, (gens, names) = future.result()
+            if gens or names:
+                card_info[i] = {'generations': gens, 'names': names}
+                logging.debug(f"✅ Card {i}: Generations: {gens}, Names: {names}")
+            else:
+                logging.debug(f"❌ No valid data for card {i}")
+
     logging.info(f"🚀 FINAL CARD INFO: {card_info}")
     return card_info
 
@@ -248,54 +243,91 @@ def click_bouquet_then_best_from_image(pil_image, buttons_components):
     card_info = extract_card_generations(pil_image)
     logging.debug(f"Card info: {card_info}")
 
+    claimed_indexes = []
+
     # Claim cards without generation numbers
-    claimed_any = False
     for i in range(card_count):
         generations = card_info.get(i, {}).get('generations', {})
         if not generations:
-            # Claim the card if it has no generation numbers
             click_discord_button(button_ids[i])
+            time.sleep(1)
             logging.info(f"✅ Claimed card at index {i} (no generation number)")
-            claimed_any = True
+            claimed_indexes.append(i)
 
-    # If all cards have generation numbers, choose the best match or lowest generation
-    if not claimed_any:
-        best_match_index = None
-        best_rank = float('inf')
-        lowest_gen_index = None
-        lowest_gen_value = float('inf')
+    # Loop only over remaining unclaimed cards
+    best_match_index = None
+    best_rank = float('inf')
+    lowest_gen_index = None
+    lowest_gen_value = float('inf')
 
-        for i in range(card_count):
-            names = card_info[i]['names']
-            generations = card_info[i]['generations']
+    for i in range(card_count):
+        if i in claimed_indexes or i not in card_info:
+            continue
 
-            # Find best character match
-            matches = find_best_character_match(names)
-            for _, match_name, score, rank in matches:
-                if score >= 95 and rank < best_rank:
-                    best_rank = rank
-                    best_match_index = i
+        names = card_info[i].get('names', [])
+        generations = card_info[i].get('generations', {})
 
-            # Track the card with the lowest generation number
-            if generations:
-                gen_value = min(generations.values())
-                if gen_value < lowest_gen_value:
-                    lowest_gen_value = gen_value
-                    lowest_gen_index = i
+        # Find best character match
+        matches = find_best_character_match(names)
+        for _, match_name, score, rank in matches:
+            if score >= 95 and rank < best_rank:
+                best_rank = rank
+                best_match_index = i
 
-        # Choose the best match or the card with the lowest generation number
-        if best_match_index is not None:
-            chosen_index = best_match_index
-        elif lowest_gen_index is not None:
-            chosen_index = lowest_gen_index
-        else:
-            chosen_index = 0  # Fallback to the first card if no other criteria are met
+        # Track the card with the lowest generation number
+        if generations:
+            gen_value = min(generations.values())
+            if gen_value < lowest_gen_value:
+                lowest_gen_value = gen_value
+                lowest_gen_index = i
 
+    # Choose the best match or the card with the lowest generation number
+    if best_match_index is not None:
+        chosen_index = best_match_index
+    elif lowest_gen_index is not None:
+        chosen_index = lowest_gen_index
+    else:
+        # Fallback to first unclaimed card
+        unclaimed = [i for i in range(card_count) if i not in claimed_indexes]
+        chosen_index = unclaimed[0] if unclaimed else None
+
+    if chosen_index is not None:
         click_discord_button(button_ids[chosen_index])
         logging.info(f"✅ Claimed card at index {chosen_index} (best match or lowest generation)")
+    else:
+        logging.warning("⚠️ No card was chosen to be claimed.")
 
 # Create Discum client
 bot = discum.Client(token=TOKEN, log=False)
+
+
+def keep_alive(bot):
+    previous_latency = None
+    failure_count = 0
+
+    while not stop_event.is_set():
+        time.sleep(30)
+        try:
+            latency = bot.gateway.latency
+            logging.debug(f"📶 Gateway latency: {latency}")
+
+            if latency is None or latency == previous_latency:
+                failure_count += 1
+                logging.warning(f"⚠️ Latency unchanged or missing ({failure_count}x).")
+            else:
+                failure_count = 0  # Reset on healthy update
+
+            previous_latency = latency
+
+            if failure_count >= 3:
+                logging.error("🛑 Gateway appears frozen. Reconnecting...")
+                bot.gateway.close()
+                time.sleep(3)
+                bot.gateway.run(auto_reconnect=True)
+                failure_count = 0  # Reset after reconnect
+
+        except Exception as e:
+            logging.error(f"❌ keep_alive check failed: {e}")
 
 @bot.gateway.command
 def on_message(resp):
@@ -309,8 +341,6 @@ def on_message(resp):
     author_id = str(data.get('author', {}).get('id'))
     content = data.get('content', '')
     logging.debug(f"📨 Message from {author_id} in channel {channel_id} - Content: {content}")
-    if channel_id != str(CHANNEL_ID):
-        return
     if author_id == "853629533855809596":
         attachments = data.get('attachments', [])
         components = data.get('components', [])
@@ -326,7 +356,6 @@ def on_message(resp):
                 except Exception as e:
                     logging.warning(f"⚠️ Failed to process image: {e}")
                 return
-
 def signal_handler(sig, frame):
     """Handle termination signals to gracefully shutdown."""
     logging.info("🛑 Termination signal received. Shutting down...")
@@ -340,6 +369,10 @@ signal.signal(signal.SIGTERM, signal_handler)
 # Start the periodic sender using a simple thread
 sd_thread = threading.Thread(target=periodic_sd_sender, args=(bot, stop_event), daemon=True)
 sd_thread.start()
+
+# Start gateway keep-alive checker
+ka_thread = threading.Thread(target=keep_alive, args=(bot,), daemon=True)
+ka_thread.start()
 
 # Run the bot
 bot.gateway.run(auto_reconnect=True)
