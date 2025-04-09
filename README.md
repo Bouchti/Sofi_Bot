@@ -1,85 +1,96 @@
-# 🌾 Sofi_Bot – Automated Card Farming Bot for Sofi Discord Bot
+🌾 Sofi_Bot – Automated Card Farming Bot for Sofi Discord Bot
+🤖 Automate your Sofi experience and efficiently farm cards using powerful OCR, image processing, and intelligent decision-making!
 
-🤖 Automate your **Sofi** experience and efficiently farm cards with powerful OCR and smart decision-making!
+📌 Overview
+Sofi_Bot is a smart automation bot designed to interact with the Sofi Discord Bot — a card-collecting game on Discord. This tool simulates user behavior by detecting dropped cards, analyzing image content, and automatically claiming the best card using OCR and custom logic.
 
----
+⚙️ Features
+🔁 Automated Farming – Periodically sends sd command every 8 minutes to drop cards
 
-## 📌 Overview
+🧠 Smart Claiming Logic
 
-**Sofi_Bot** is a powerful automation bot designed to interact with the [Sofi Discord Bot](https://discord.com/invite/sofi) — a popular card-collecting game on Discord. This tool simulates intelligent user behavior by processing images from drops, reading text, detecting special cards (like bouquets), and auto-claiming the best card.
+Detects and instantly claims bouquet-style cards
 
----
+Extracts generation numbers and character names from card images
 
-## ⚙️ Features
+Prioritizes top-tier characters using a customizable list
 
-- 🔁 **Automated Farming** – Periodically sends the `sd` command to drop cards every 8 minutes
-- 🧠 **Smart Claiming Logic**:
-  - Detects **bouquet-style** cards and claims them automatically
-  - Analyzes **generation numbers** and **character names**
-  - Uses a predefined list to prioritize **top characters**
-  - Claims cards with no generation first, then lowest gen or best match
-- 🧾 **OCR Text Recognition** – Uses `EasyOCR` to extract generation numbers and names
-- 🧩 **Template Matching** – Matches icons like bouquet buttons with OpenCV
-- ⚙️ **Fully Configurable** – Adjust filters, timers, templates, and recognition logic
+Claims cards with no generation first, then the lowest gen, or best match
 
----
+🧾 OCR Text Recognition – Uses EasyOCR to extract card details with high accuracy
 
-## 🧠 How It Works
+🧩 Template Matching – Detects bouquet buttons using OpenCV
 
-- Listens for new messages from Sofi using `discum`
-- Parses attached images using EasyOCR
-- Extracts character name + generation
-- Uses logic to select the best card to claim
-- Sends button click requests via Discord's API
-- Supports auto-reconnect and self-healing
+💥 Fast & Responsive – Uses multi-threading for parallel image processing
 
----
+🔄 Self-Healing Gateway – Auto-reconnects on Discord gateway freezes
 
-## 🖥️ Technologies Used
+🔧 Fully Configurable – Easy to modify filters, logic, and timing from .env and source
 
-- `Python 3.9+`
-- [`discum`](https://github.com/Merubokkusu/Discum) – lightweight Discord API wrapper
-- `EasyOCR` – for optical character recognition
-- `OpenCV` – for image preprocessing and template matching
-- `requests` – for HTTP interactions with Discord API
-- `dotenv` – for managing API keys and bot tokens
-- `rapidfuzz` – for fuzzy character name matching
-- `Pillow (PIL)` – for image manipulation
+🧠 How It Works
+Listens for SOFI drops across one or multiple Discord servers/channels using discum
 
----
+Parses attached images using EasyOCR and OpenCV
 
-## 🚀 Getting Started
+Extracts generation + character name
 
-1. 📅 **Clone the Repository**
+Compares names using fuzzy logic (RapidFuzz)
 
-   ```bash
-   git clone https://github.com/Bouchti/Sofi_Bot.git
-   cd Sofi_Bot
-   ```
+Sends button interactions directly to the Discord API to claim
 
-2. 📦 **Install Dependencies**
+Resilient to freezes or disconnections with auto-restart logic
 
-   ```bash
-   pip install -r requirements.txt
-   ```
+🖥️ Technologies Used
+🐍 Python 3.9+
 
-3. 🛠️ **Run the Bot**
+⚙️ discum – Discord API wrapper
 
-   ```bash
-   python farmV3.py
-   ```
+🔍 EasyOCR – Optical character recognition
+
+🧠 RapidFuzz – For fuzzy matching card names
+
+🧪 OpenCV – Template matching & image denoising
+
+🖼️ Pillow – Image processing
+
+🌐 requests – Interact with Discord's API
+
+🔐 dotenv – Manage tokens/configs securely
+
+🚀 Getting Started
+1️⃣ Clone the Repo
+bash
+Copier
+Modifier
+git clone https://github.com/Bouchti/Sofi_Bot.git
+cd Sofi_Bot
+2️⃣ Install Dependencies
+bash
+Copier
+Modifier
+pip install -r requirements.txt
+3️⃣ Configure .env
+Create a .env file with:
+
+env
+Copier
+Modifier
+DISCORD_TOKEN=your_bot_token
+GUILD_ID=optional_default_guild_id
+CHANNEL_ID=optional_default_channel_id
+USER_ID=your_user_id
+Your bot must be in the server and have access to the drop channel.
+
+4️⃣ Run the Bot
+bash
+Copier
+Modifier
+python farmV3.py
 ⚠️ Disclaimer
-This bot interacts with Discord's API and should be used responsibly and ethically. Misuse may violate Discord's Terms of Service. Use at your own risk.
+This bot interacts with Discord’s private API. Use responsibly and ethically. You must not use this bot to spam, exploit, or violate Discord’s Terms of Service.
 
----
+📸 Screenshots
+🚧 Coming soon...
 
-## 📸 Screenshots
-
-*Coming soon...*
-
----
-
-## 🧑‍💻 Author
-
-Developed by [Bouchti](https://github.com/Bouchti)
-
+🧑‍💻 Author
+Developed with ❤️ by Bouchti
