@@ -23,8 +23,17 @@ GUILD_ID = os.getenv("GUILD_ID")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 USER_ID = os.getenv("USER_ID")
 
+# Track last time the bot processed a Sofi drop
+last_processed_time = 0
+PROCESS_COOLDOWN_SECONDS = 240  # 4 minutes
+
 # Initialize logging
-logging.basicConfig(level=logging.INFO)
+# Initialize logging with timestamps
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logging.getLogger("websocket").setLevel(logging.CRITICAL)
 logging.getLogger("discum.gateway.gateway").setLevel(logging.ERROR)
 
@@ -56,25 +65,36 @@ def periodic_sd_sender(bot, stop_event):
             logging.info("📤 Sent 'sd' command.")
         except Exception as e:
             logging.exception("⚠️ Failed to send 'sd'")
-def click_discord_button(custom_id):
-    """Click a Discord button using its custom ID."""
+def click_discord_button(custom_id, channel_id, guild_id):
+    if not LAST_DROP_MESSAGE_ID or len(LAST_DROP_MESSAGE_ID) < 15:
+        logging.warning("❌ Not sending interaction: Invalid or missing message ID.")
+        return
+
     url = "https://discord.com/api/v9/interactions"
     headers = {
         "Authorization": TOKEN,
         "Content-Type": "application/json",
     }
+
     payload = {
         "type": 3,
-        "guild_id": GUILD_ID,
-        "channel_id": CHANNEL_ID,
+        "guild_id": guild_id,
+        "channel_id": channel_id,  # 👈 Use dynamic channel_id
         "message_id": LAST_DROP_MESSAGE_ID,
-        "application_id": "853629533855809596",  # Sofi's App ID
+        "application_id": "853629533855809596",  # Sofi
         "session_id": bot.gateway.session_id,
         "data": {
             "component_type": 2,
             "custom_id": custom_id
         }
     }
+    logging.debug(f"""
+📤   Preparing interaction payload:
+     Message ID : {LAST_DROP_MESSAGE_ID}
+     Channel ID : {channel_id}
+     Guild ID   : {guild_id}
+     Session ID : {bot.gateway.session_id}
+    """)
     response = session.post(url, json=payload, headers=headers)
     if response.status_code == 204:
         logging.info(f"✅ Successfully clicked button with ID: {custom_id}")
@@ -231,7 +251,7 @@ def find_best_character_match(card_names):
             logging.error(f"Error matching {name}: {e}")
     return matches
 
-def click_bouquet_then_best_from_image(pil_image, buttons_components, image_received_time):
+def click_bouquet_then_best_from_image(pil_image, buttons_components, image_received_time, channel_id ,guild_id):
     """Process the Sofi card image and click the appropriate buttons for cards without generation numbers."""
     logging.info("🧠 Starting processing of the Sofi card image...")
     card_count = 3
@@ -250,7 +270,7 @@ def click_bouquet_then_best_from_image(pil_image, buttons_components, image_rece
     for i in range(card_count):
         generations = card_info.get(i, {}).get('generations', {})
         if not generations:
-            click_discord_button(button_ids[i])
+            click_discord_button(button_ids[i], channel_id, guild_id)
             # Record the time when the card is claimed
             card_claimed_time = time.time()
         
@@ -299,8 +319,18 @@ def click_bouquet_then_best_from_image(pil_image, buttons_components, image_rece
         unclaimed = [i for i in range(card_count) if i not in claimed_indexes]
         chosen_index = unclaimed[0] if unclaimed else None
 
+    global last_processed_time
+    now = time.time()
+    # Only apply cooldown to generation-based claims
+    generations = card_info.get(chosen_index, {}).get('generations', {})
+
+    if generations and (now - last_processed_time < PROCESS_COOLDOWN_SECONDS):
+        logging.info("⏱️ Skipping generation-based claim — cooldown not expired.")
+        return
+
     if chosen_index is not None:
-        click_discord_button(button_ids[chosen_index])
+        click_discord_button(button_ids[chosen_index], channel_id, guild_id)
+        last_processed_time = now
         if best_match_index is not None:
             logging.info(f"✅ Claimed card {chosen_index+1} (⭐best match⭐)")
         else:
@@ -330,7 +360,7 @@ def keep_alive(bot):
 
             if latency is None or latency == previous_latency:
                 failure_count += 1
-                logging.warning(f"⚠️ Latency unchanged or missing ({failure_count}x).")
+                logging.debug(f"⚠️ Latency unchanged or missing ({failure_count}x).")
             else:
                 failure_count = 0
 
@@ -346,36 +376,52 @@ def keep_alive(bot):
         except Exception as e:
             logging.error(f"❌ keep_alive check failed: {e}")
 
+
+@bot.gateway.command
+def on_ready(resp):
+    if resp.event.ready:
+        user = resp.parsed.auto().get('user')
+        if user:
+            logging.info(f"✅ Bot connected as {user['username']}#{user['discriminator']}")
+        else:
+            logging.info("✅ Bot connected, but user info is missing.")       
+
+SOFI_BOT_ID = "853629533855809596"  # Official Sofi bot ID
+
 @bot.gateway.command
 def on_message(resp):
-    """Handle incoming messages from Discord."""
     global LAST_DROP_MESSAGE_ID
-    logging.debug("🛎️ Event received")
-    if not hasattr(resp, 'raw') or 't' not in resp.raw or resp.raw['t'] != "MESSAGE_CREATE":
+
+    if not hasattr(resp, 'raw') or resp.raw.get('t') != "MESSAGE_CREATE":
         return
+
     data = resp.raw['d']
+    author_id = str(data.get("author", {}).get("id"))
     channel_id = str(data.get('channel_id'))
-    author_id = str(data.get('author', {}).get('id'))
-    content = data.get('content', '')
-    logging.debug(f"📨 Message from {author_id} in channel {channel_id} - Content: {content}")
-    if author_id == "853629533855809596":
-        attachments = data.get('attachments', [])
-        components = data.get('components', [])
+    guild_id = str(data.get("guild_id"))
+    if author_id != SOFI_BOT_ID:
+        return  # 🚫 Ignore anything not from Sofi bot
+
+    attachments = data.get("attachments", [])
+    components = data.get("components", [])
+
+    # 💡 Only set this if it's from Sofi
+    if components and len(components) > 0:
         LAST_DROP_MESSAGE_ID = data.get("id")
-        for attachment in attachments:
-            filename = attachment.get('filename', '')
-            if any(filename.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]):
-                try:
-                    logging.debug(f"📥 Found image attachment: {filename}")
-                    response = session.get(attachment.get('url'))
-                    image = Image.open(BytesIO(response.content)).convert("RGB")
-                     # Record the time when the image is received
-                    image_received_time = time.time()
-                    # Pass the image_received_time to the function
-                    click_bouquet_then_best_from_image(image, components, image_received_time)
-                except Exception as e:
-                    logging.warning(f"⚠️ Failed to process image: {e}")
-                return
+        logging.debug(f"💾 LAST_DROP_MESSAGE_ID set to {LAST_DROP_MESSAGE_ID}")
+
+    for attachment in attachments:
+        filename = attachment.get('filename', '')
+        if any(filename.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]):
+            try:
+                response = session.get(attachment.get('url'))
+                image = Image.open(BytesIO(response.content)).convert("RGB")
+                image_received_time = time.time()
+                click_bouquet_then_best_from_image(image, components, image_received_time, channel_id, guild_id)
+            except Exception as e:
+                logging.warning(f"⚠️ Failed to process image: {e}")
+            return
+        
 def signal_handler(sig, frame):
     """Handle termination signals to gracefully shutdown."""
     logging.info("🛑 Termination signal received. Shutting down...")
@@ -395,4 +441,11 @@ ka_thread = threading.Thread(target=keep_alive, args=(bot,), daemon=True)
 ka_thread.start()
 
 # Run the bot
-bot.gateway.run(auto_reconnect=True)
+logging.info("🔌 Connecting to Discord gateway...")
+
+try:
+    bot.gateway.run(auto_reconnect=True)
+except Exception as e:
+    logging.critical(f"❌ Failed to connect to Discord gateway: {e}")
+    logging.critical("🔁 Please check your DISCORD_TOKEN, internet connection, or Discord API status.")
+    sys.exit(1)
