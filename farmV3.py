@@ -39,19 +39,23 @@ session = requests.Session()
 stop_event = threading.Event()
 
 def periodic_sd_sender(bot, stop_event):
-    """Send the 'sd' command periodically."""
     while not stop_event.is_set():
-        wait_time = 480 + random.uniform(0, 10)  # 8 minutes + 0–10 seconds
+        wait_time = 480 + random.uniform(0, 10)
         logging.info(f"⏳ Waiting {wait_time} seconds before sending 'sd'...")
         stop_event.wait(wait_time)
         if stop_event.is_set():
             break
+
+        # 🔐 Make sure session is active
+        if not bot.gateway.session_id:
+            logging.warning("⚠️ Gateway session is missing. Skipping 'sd' command.")
+            continue
+
         try:
             bot.sendMessage(CHANNEL_ID, "sd")
             logging.info("📤 Sent 'sd' command.")
         except Exception as e:
             logging.exception("⚠️ Failed to send 'sd'")
-
 def click_discord_button(custom_id):
     """Click a Discord button using its custom ID."""
     url = "https://discord.com/api/v9/interactions"
@@ -326,18 +330,18 @@ def keep_alive(bot):
 
             if latency is None or latency == previous_latency:
                 failure_count += 1
-                logging.debug(f"⚠️ Latency unchanged or missing ({failure_count}x).")
+                logging.warning(f"⚠️ Latency unchanged or missing ({failure_count}x).")
             else:
-                failure_count = 0  # Reset on healthy update
+                failure_count = 0
 
             previous_latency = latency
 
             if failure_count >= 3:
-                logging.error("🛑 Gateway appears frozen. Reconnecting...")
-                bot.gateway.close()
-                time.sleep(3)
-                bot.gateway.run(auto_reconnect=True)
-                failure_count = 0  # Reset after reconnect
+                logging.error("🛑 Gateway appears frozen. Restarting process...")
+                stop_event.set()
+                time.sleep(1)
+                # Restart the entire Python process
+                os.execv(sys.executable, [sys.executable] + sys.argv)
 
         except Exception as e:
             logging.error(f"❌ keep_alive check failed: {e}")
