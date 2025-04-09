@@ -1,8 +1,8 @@
-opencv-python
-pyautogui
+discum==1.4.0
 numpy
-pillow
-pygetwindow
-pyscreeze
-pymsgbox
+Pillow
 python-dotenv
+requests
+opencv-python
+easyocr
+rapidfuzz
