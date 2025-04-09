@@ -1,93 +1,84 @@
-🌾 Sofi_Bot – Automated Card Farming Bot for Sofi Discord Bot
-🤖 Automate your Sofi experience and efficiently farm cards using powerful OCR, image processing, and intelligent decision-making!
+# 🌾 Sofi_Bot – Automated Card Farming Bot for Sofi Discord Bot
 
-📌 Overview
-Sofi_Bot is a smart automation bot designed to interact with the Sofi Discord Bot — a card-collecting game on Discord. This tool simulates user behavior by detecting dropped cards, analyzing image content, and automatically claiming the best card using OCR and custom logic.
+🤖 Automate your **Sofi** experience and efficiently farm cards using powerful OCR, image processing, and smart decision-making!
 
-⚙️ Features
-🔁 Automated Farming – Periodically sends sd command every 8 minutes to drop cards
+---
 
-🧠 Smart Claiming Logic
+## 📌 Overview
 
-Detects and instantly claims bouquet-style cards
+**Sofi_Bot** is a smart automation bot designed to interact with the [Sofi Discord Bot](https://discord.com/invite/sofi), a popular card-collecting game.  
+This tool detects dropped cards, analyzes image content, and automatically claims the best card using intelligent logic.
 
-Extracts generation numbers and character names from card images
+---
 
-Prioritizes top-tier characters using a customizable list
+## ⚙️ Features
 
-Claims cards with no generation first, then the lowest gen, or best match
+- 🔁 **Automated Farming** – Sends the `sd` command every 8 minutes to drop cards  
+- 💐 **Bouquet Detection** – Instantly claims bouquet-style cards using template matching  
+- 🧠 **Smart Claiming Logic**:
+  - Reads card **generation numbers** and **character names**
+  - Claims cards with **no generation first**
+  - Selects card with **lowest generation** or **best-ranked match**
+- 🧾 **OCR Recognition** – Uses EasyOCR for accurate text extraction  
+- 🧩 **Template Matching** – Uses OpenCV to detect buttons/icons  
+- 💥 **Fast & Responsive** – Multi-threaded image processing for low latency  
+- 🔄 **Self-Healing** – Automatically restarts when Discord gateway is frozen  
+- ⚙️ **Fully Configurable** – Edit filters, logic, timers, and templates easily
 
-🧾 OCR Text Recognition – Uses EasyOCR to extract card details with high accuracy
+---
 
-🧩 Template Matching – Detects bouquet buttons using OpenCV
+## 🧠 How It Works
 
-💥 Fast & Responsive – Uses multi-threading for parallel image processing
+1. Listens to Sofi drops using **discum**
+2. Processes attached card images with **EasyOCR** + **OpenCV**
+3. Extracts generation & name from image
+4. Matches name using fuzzy logic (**RapidFuzz**)
+5. Sends claim interactions via the Discord API
+6. Supports multi-server + auto-reconnect
 
-🔄 Self-Healing Gateway – Auto-reconnects on Discord gateway freezes
+---
 
-🔧 Fully Configurable – Easy to modify filters, logic, and timing from .env and source
+## 🖥️ Technologies Used
 
-🧠 How It Works
-Listens for SOFI drops across one or multiple Discord servers/channels using discum
+- 🐍 Python 3.9+
+- ⚙️ `discum` – Discord API wrapper
+- 🔍 `EasyOCR` – OCR text extraction
+- 🧠 `RapidFuzz` – Fuzzy name matching
+- 🧪 `OpenCV` – Template matching
+- 🖼️ `Pillow` – Image processing
+- 🌐 `requests` – API communication
+- 🔐 `dotenv` – Manage tokens and secrets
 
-Parses attached images using EasyOCR and OpenCV
+---
 
-Extracts generation + character name
+## 🚀 Getting Started
 
-Compares names using fuzzy logic (RapidFuzz)
+### 1️⃣ Clone the Repository
 
-Sends button interactions directly to the Discord API to claim
-
-Resilient to freezes or disconnections with auto-restart logic
-
-🖥️ Technologies Used
-🐍 Python 3.9+
-
-⚙️ discum – Discord API wrapper
-
-🔍 EasyOCR – Optical character recognition
-
-🧠 RapidFuzz – For fuzzy matching card names
-
-🧪 OpenCV – Template matching & image denoising
-
-🖼️ Pillow – Image processing
-
-🌐 requests – Interact with Discord's API
-
-🔐 dotenv – Manage tokens/configs securely
-
-🚀 Getting Started
-1️⃣ Clone the Repo
-bash
-Copier
-Modifier
+```bash
 git clone https://github.com/Bouchti/Sofi_Bot.git
 cd Sofi_Bot
-2️⃣ Install Dependencies
-bash
-Copier
-Modifier
+
+### 2️⃣ Install Dependencies
 pip install -r requirements.txt
-3️⃣ Configure .env
-Create a .env file with:
 
-env
-Copier
-Modifier
-DISCORD_TOKEN=your_bot_token
-GUILD_ID=optional_default_guild_id
-CHANNEL_ID=optional_default_channel_id
-USER_ID=your_user_id
-Your bot must be in the server and have access to the drop channel.
+### 3️⃣ Create .env Configuration
+DISCORD_TOKEN=your_discord_bot_token
+GUILD_ID=your_main_server_id        # Optional
+CHANNEL_ID=your_main_channel_id     # Only used for sending 'sd' commands
+USER_ID=your_user_id                # Optional (for logs)
 
-4️⃣ Run the Bot
-bash
-Copier
-Modifier
+✅ Make sure .env is listed in .gitignore to avoid pushing it to GitHub.
+
+### 4️⃣ Run the Bot
+
 python farmV3.py
+
 ⚠️ Disclaimer
-This bot interacts with Discord’s private API. Use responsibly and ethically. You must not use this bot to spam, exploit, or violate Discord’s Terms of Service.
+This bot interacts with Discord’s internal API. Use responsibly.
+You must not use this bot to spam, exploit, or violate Discord’s Terms of Service.
+
+Use at your own risk.
 
 📸 Screenshots
 🚧 Coming soon...
