@@ -16,6 +16,10 @@ import threading
 import signal
 import sys
 from concurrent.futures import ThreadPoolExecutor
+import json
+from threading import Lock
+last_drop_id_lock = Lock()
+last_processed_time_lock = Lock()
 # Load environment variables
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -30,7 +34,7 @@ PROCESS_COOLDOWN_SECONDS = 240  # 4 minutes
 # Initialize logging
 # Initialize logging with timestamps
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
@@ -39,7 +43,7 @@ logging.getLogger("discum.gateway.gateway").setLevel(logging.ERROR)
 
 # Initialize global variables
 LAST_DROP_MESSAGE_ID = "0"
-reader = easyocr.Reader(['en'], gpu=True)
+reader = easyocr.Reader(['en'], gpu=True, verbose=False)
 
 # Initialize requests session
 session = requests.Session()
@@ -66,7 +70,10 @@ def periodic_sd_sender(bot, stop_event):
         except Exception as e:
             logging.exception("⚠️ Failed to send 'sd'")
 def click_discord_button(custom_id, channel_id, guild_id):
-    if not LAST_DROP_MESSAGE_ID or len(LAST_DROP_MESSAGE_ID) < 15:
+    with last_drop_id_lock:
+        message_id = LAST_DROP_MESSAGE_ID
+
+    if not message_id or len(message_id) < 15:
         logging.warning("❌ Not sending interaction: Invalid or missing message ID.")
         return
 
@@ -80,7 +87,7 @@ def click_discord_button(custom_id, channel_id, guild_id):
         "type": 3,
         "guild_id": guild_id,
         "channel_id": channel_id,  # 👈 Use dynamic channel_id
-        "message_id": LAST_DROP_MESSAGE_ID,
+        "message_id": message_id ,
         "application_id": "853629533855809596",  # Sofi
         "session_id": bot.gateway.session_id,
         "data": {
@@ -102,20 +109,41 @@ def click_discord_button(custom_id, channel_id, guild_id):
         logging.warning(f"❌ Failed to click button. Status: {response.status_code}, Response: {response.text}")
 
 def preprocess_string(s):
-    """Preprocess a string by removing punctuation, converting to uppercase, and sorting tokens."""
     tokens = re.sub(r'[^a-zA-Z0-9\s]', ' ', s).upper().split()
     return ' '.join(sorted(tokens))
 
 def load_top_characters():
-    """Load top characters from a file."""
     try:
-        with open("top_sofi_characters.txt", "r", encoding="utf-8") as f:
-            top_characters_list = [preprocess_string(name.strip()) for name in f.readlines()]
-            return top_characters_list, set(top_characters_list)
-    except FileNotFoundError:
-        logging.warning("⚠️ 'top_sofi_characters.txt' not found. AI card evaluation will be skipped.")
-        return [], set()
+        with open("sofi_leaderboard.json", "r", encoding="utf-8") as f:
+            raw_data = json.load(f)
 
+            if isinstance(raw_data, list):
+                entries = raw_data
+            else:
+                entries = raw_data.get("data", [])
+
+            processed = []
+            for entry in entries:
+                char_name = entry.get("character")
+                series = entry.get("series")
+                likes = entry.get("likes", 0)
+
+                if not char_name or not series:
+                    logging.warning("⚠️ Entry missing 'character' or 'series' key, skipping entry.")
+                    continue
+
+                combined = preprocess_string(f"{char_name} - {series}")
+                processed.append({
+                    "full_name": combined,
+                    "likes": likes
+                })
+
+            processed_set = {entry["full_name"] for entry in processed}
+            return processed, processed_set
+    except FileNotFoundError:
+        logging.warning("⚠️ 'sofi_leaderboard.json' not found.")
+        return [], set()
+    
 TOP_CHARACTERS_LIST, TOP_CHARACTERS_SET = load_top_characters()
 
 def preprocess_image(image):
@@ -125,79 +153,85 @@ def preprocess_image(image):
         image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     return image  # nothing else
 
-def extract_card_names_from_ocr_results(ocr_results):
-    """Extract card name from OCR results if index 0 becomes a valid generation after processing."""
-    logging.debug(f"🔍 Raw OCR Results: {ocr_results}")
-
-    if len(ocr_results) < 2:
-        logging.warning("⚠️ Not enough OCR results to extract name.")
-        return []
-
-    # Try to clean and validate index 0 as a generation
-    processed_gen = clean_generation_text([ocr_results[0]])
-    if not processed_gen:
-        logging.warning("⚠️ Index 0 is not a valid generation after processing.")
-        return []
-
-    # If generation is valid, assume index 1 is the name
-    card_name = ocr_results[1].strip()
-    logging.debug(f"🧹 Card Name: {card_name}")
-    return [card_name]
-
-def clean_generation_text(ocr_results):
-    """Clean and normalize generation text extracted from OCR."""
-    cleaned_generations = {}
-    logging.debug(f"🔍 Raw OCR Results: {ocr_results}")
-    for text in ocr_results:
-        if len(cleaned_generations) >= 3:
-            break
-        original_text = text
-        text = re.sub(r'[^a-zA-Z0-9]', '', text)
-        text = text.replace("i", "1").replace("I", "1").replace("o", "0").replace("O", "0").replace("g", "9").replace("s", "5").replace("S", "5").replace("B", "8").replace("l", "1")
-        if text.startswith("0") or text.startswith("6") or text.startswith("5") or text.startswith("9"):
-            text = "G" + text[1:]
-        match = re.match(r'^(G?)(\d{1,4})$', text)
-        if match:
-            prefix, gen_number = match.groups()
-            if not prefix:
-                gen_number = "G" + gen_number
-            else:
-                gen_number = prefix + gen_number
-            if len(gen_number) > 5:
-                gen_number = gen_number[:5]
-            cleaned_generations[gen_number] = int(gen_number[1:])
-            logging.debug(f"✅ Final Processed: {original_text} → {gen_number}")
-    logging.debug(f"🚀 FINAL NORMALIZED GENERATIONS: {cleaned_generations}")
-    return cleaned_generations
-
 def extract_generation_with_easyocr(image):
-    """Extract generation numbers and card names from an image using EasyOCR."""
-    # Convert PIL Image to NumPy array if necessary
+    start_time = time.time()
+
+    def clean_generation_text(ocr_results):
+        cleaned_generations = {}
+        logging.debug(f"🔍 Raw OCR Results: {ocr_results}")
+
+        for text in ocr_results:
+            if len(cleaned_generations) >= 3:
+                break
+
+            original_text = text.strip()
+            text = re.sub(r'[^a-zA-Z0-9]', '', original_text)
+
+            # Apply replacements only for generation
+            text = text.replace("i", "1").replace("I", "1") \
+                       .replace("o", "0").replace("O", "0") \
+                       .replace("g", "9").replace("s", "5").replace("S", "5") \
+                       .replace("B", "8").replace("l", "1")
+
+            if text.startswith(("0", "6", "5", "9")) and not text.upper().startswith("G"):
+                text = "G" + text[1:]
+
+            match = re.match(r'^G(\d{3,4})$', text.upper())
+            if match:
+                gen_number = f"G{match.group(1)}"
+                cleaned_generations[gen_number] = int(match.group(1))
+                logging.debug(f"✅ Final Processed: {original_text} → {gen_number}")
+            else:
+                logging.debug(f"❌ Rejected: {original_text} → {text}")
+
+        logging.debug(f"🚀 FINAL NORMALIZED GENERATIONS: {cleaned_generations}")
+        return cleaned_generations
+
+    def extract_card_name_and_series(ocr_results):
+        logging.debug(f"🔍 Raw OCR Results: {ocr_results}")
+        if not ocr_results or len(ocr_results) < 2:
+            return None, None
+
+        gen_index = -1
+        for i, text in enumerate(ocr_results):
+            if clean_generation_text([text]):
+                gen_index = i
+                break
+
+        if gen_index == -1 or gen_index + 1 >= len(ocr_results):
+            return None, None
+
+        name = ocr_results[gen_index + 1].strip()
+        series = ocr_results[gen_index + 2].strip() if gen_index + 2 < len(ocr_results) else None
+
+        logging.debug(f"🧹 Card Name: {name}")
+        logging.debug(f"🧹 Series Name: {series}")
+        return name, series
+
+    # Convert PIL to array
     if isinstance(image, Image.Image):
         image = np.array(image)
 
-    start_time = time.time()
-    target_width = 400
+    target_width = 300
     scale_ratio = target_width / image.shape[1]
     image = cv2.resize(image, (target_width, int(image.shape[0] * scale_ratio)), interpolation=cv2.INTER_AREA)
+
     if len(image.shape) == 2 or image.shape[2] == 1:
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-    if np.std(image) < 50:  # low contrast image    
-        image = cv2.fastNlMeansDenoisingColored(image, None, 10, 10, 7, 21)
-    extracted_text = reader.readtext(image, detail=0)
+
+    #if np.std(image) < 50:
+        #image = cv2.fastNlMeansDenoisingColored(image, None, 10, 10, 7, 21)
+
+    extracted_text = reader.readtext(image, detail=0, batch_size=2)
     logging.debug(f"🔍 EasyOCR Raw Extracted: {extracted_text}")
 
-    # Extract generations and card names
     generations = clean_generation_text(extracted_text)
-    card_names = extract_card_names_from_ocr_results(extracted_text)
+    name, series = extract_card_name_and_series(extracted_text)
+
     time_taken = time.time() - start_time
     logging.debug(f"⏱️ Time taken for extract_generation_with_easyocr: {time_taken:.2f} seconds")
-    
-    # Handle empty results
-    if not generations and not card_names:
-        logging.warning("⚠️ No valid generation numbers or card names found.")
-    
-    return generations, card_names
+
+    return generations, name, series
 
 def extract_card_for_index(index, card_crop):
     processed = preprocess_image(card_crop)
@@ -216,46 +250,54 @@ def extract_card_generations(image):
             futures.append(executor.submit(extract_card_for_index, i, crop))
 
         for future in futures:
-            i, (gens, names) = future.result()
-            if gens or names:
-                card_info[i] = {'generations': gens, 'names': names}
-                logging.debug(f"✅ Card {i}: Generations: {gens}, Names: {names}")
+            i, (gens, name, series) = future.result()
+            if gens or name:
+                card_info[i] = {
+                    'generations': gens,
+                    'name': name,
+                    'series': series
+                }
+                logging.debug(f"✅ Card {i}: Gen: {gens}, Name: {name}, Series: {series}")
             else:
                 logging.debug(f"❌ No valid data for card {i}")
 
     logging.debug(f"🚀 FINAL CARD INFO: {card_info}")
     return card_info
 
-def find_best_character_match(card_names):
-    logging.debug(f"🔍 Starting character match for names: {card_names}")
-    matches = []
-    for name in card_names:
-        try:
-            normalized_name = preprocess_string(name)
-            best_match = process.extractOne(
-                normalized_name, 
-                TOP_CHARACTERS_LIST, 
-                scorer=fuzz.token_sort_ratio
-            )
-            if best_match:
-                match_name, score = best_match[0], best_match[1]
-                if score >= 95:                  
-                    rank = TOP_CHARACTERS_LIST.index(match_name)
-                    logging.info(f"⭐ Match found: {name} -> {match_name} with score {score} and rank {rank}")
-                    matches.append((name, match_name, score, rank))
-                else:
-                    logging.debug(f"⚠️ Low score match: {name} -> {match_name} with score {score}")
-            else:
-                logging.info(f"❌ No match found for: {name}")
-        except Exception as e:
-            logging.error(f"Error matching {name}: {e}")
-    return matches
+def find_best_character_match(name, series):
+    if not name:
+        return None, 0, 0, None, None  # Ensure 5 values always
 
-def click_bouquet_then_best_from_image(pil_image, buttons_components, image_received_time, channel_id ,guild_id):
+    try:
+        raw = f"{name} {series}".strip()
+        normalized = preprocess_string(raw)
+
+        best_match = process.extractOne(
+            normalized,
+            [entry["full_name"] for entry in TOP_CHARACTERS_LIST],
+            scorer=fuzz.token_sort_ratio
+        )
+
+        if best_match:
+            match_string, score, index = best_match
+            matched_entry = TOP_CHARACTERS_LIST[index]
+            return score, index, matched_entry["likes"], matched_entry["full_name"], series
+        else:
+            return None, 0, 0, None, None
+    except Exception as e:
+        logging.warning(f"⚠️ Match failed for {name} - {series}: {e}")
+        return None, 0, 0, None, None
+
+def click_bouquet_then_best_from_image(pil_image, buttons_components, image_received_time, channel_id, guild_id):
     """Process the Sofi card image and click the appropriate buttons for cards without generation numbers."""
     logging.info("🧠 Starting processing of the Sofi card image...")
     card_count = 3
-    button_ids = [btn["custom_id"] for component_row in buttons_components for btn in component_row.get("components", []) if btn["type"] == 2 and btn["style"] in (1, 2)]
+    button_ids = [
+        btn["custom_id"]
+        for component_row in buttons_components
+        for btn in component_row.get("components", [])
+        if btn["type"] == 2 and btn["style"] in (1, 2)
+    ]
 
     if len(button_ids) != 3:
         logging.warning("⚠️ Expected 3 buttons but found: %s", len(button_ids))
@@ -271,20 +313,18 @@ def click_bouquet_then_best_from_image(pil_image, buttons_components, image_rece
         generations = card_info.get(i, {}).get('generations', {})
         if not generations:
             click_discord_button(button_ids[i], channel_id, guild_id)
-            # Record the time when the card is claimed
             card_claimed_time = time.time()
-        
-        # Calculate the elapsed time
             elapsed_time = card_claimed_time - image_received_time
-            logging.info(f"⏱️ Time from image received to card claimed: {elapsed_time:.2f} seconds")
-            # you can reduce this sleep but sofi bot can ignore your next clicks
-            time.sleep(3)
-            logging.info(f"✅ Claimed card {i+1} (no generation number)")
+            time.sleep(3)  # avoid multiple ignored claims
+            logging.info(f"✅ Claimed card {i+1} (no generation number) ⏱️ {elapsed_time:.2f}s")
             claimed_indexes.append(i)
 
     # Loop only over remaining unclaimed cards
     best_match_index = None
     best_rank = float('inf')
+    best_likes = -1
+    best_match_name = None
+    best_match_series = None
     lowest_gen_index = None
     lowest_gen_value = float('inf')
 
@@ -292,57 +332,62 @@ def click_bouquet_then_best_from_image(pil_image, buttons_components, image_rece
         if i in claimed_indexes or i not in card_info:
             continue
 
-        names = card_info[i].get('names', [])
-        generations = card_info[i].get('generations', {})
+        info = card_info[i]
+        name = info.get('name')
+        series = info.get('series')
+        generations = info.get('generations', {})
 
-        # Find best character match
-        matches = find_best_character_match(names)
-        for _, match_name, score, rank in matches:
-            if score >= 95 and rank < best_rank:
-                best_rank = rank
-                best_match_index = i
+        if name and series:
+            match = find_best_character_match(name, series)
+            if match:
+                score, rank, likes, matched_name, matched_series = match
+                if score >= 97 and rank < best_rank:
+                    best_rank = rank
+                    best_likes = likes
+                    best_match_index = i
+                    best_match_name = matched_name
+                    best_match_series = matched_series
 
-        # Track the card with the lowest generation number
         if generations:
             gen_value = min(generations.values())
             if gen_value < lowest_gen_value:
                 lowest_gen_value = gen_value
                 lowest_gen_index = i
 
-    # Choose the best match or the card with the lowest generation number
     if best_match_index is not None:
-        chosen_index = best_match_index
-    elif lowest_gen_index is not None:
-        chosen_index = lowest_gen_index
-    else:
-        # Fallback to first unclaimed card
-        unclaimed = [i for i in range(card_count) if i not in claimed_indexes]
-        chosen_index = unclaimed[0] if unclaimed else None
+            logging.info(f"🔎 Match: {best_match_name} from {best_match_series} with ❤️ {best_likes} likes")
+
+    chosen_index = (
+        best_match_index if best_match_index is not None
+        else lowest_gen_index if lowest_gen_index is not None
+        else next((i for i in range(card_count) if i not in claimed_indexes), None)
+    )
 
     global last_processed_time
     now = time.time()
-    # Only apply cooldown to generation-based claims
     generations = card_info.get(chosen_index, {}).get('generations', {})
+    with last_processed_time_lock:
+        if generations and (now - last_processed_time < PROCESS_COOLDOWN_SECONDS):
+            logging.info("⏱️ Skipping generation-based claim — cooldown not expired.")
+            return
 
-    if generations and (now - last_processed_time < PROCESS_COOLDOWN_SECONDS):
-        logging.info("⏱️ Skipping generation-based claim — cooldown not expired.")
-        return
+        if chosen_index is not None:
+            click_discord_button(button_ids[chosen_index], channel_id, guild_id)
+            last_processed_time = now
 
-    if chosen_index is not None:
-        click_discord_button(button_ids[chosen_index], channel_id, guild_id)
-        last_processed_time = now
-        if best_match_index is not None:
-            logging.info(f"✅ Claimed card {chosen_index+1} (⭐best match⭐)")
+            card_claimed_time = time.time()
+            elapsed_time = card_claimed_time - image_received_time
+
+            if best_match_index is not None:
+                logging.info(f"✅ Claimed card {chosen_index+1} (⭐ best match ⭐)")
+            else:
+                logging.info(f"✅ Claimed card {chosen_index+1} (🥱 lowest generation 🥱)")
+
+            logging.info(f"⏱️ Time from image received to card claimed: {elapsed_time:.2f} seconds")
         else:
-            logging.info(f"✅ Claimed card {chosen_index+1} (🥱lowest generation🥱)")
-        # Record the time when the card is claimed
-        card_claimed_time = time.time()
-        
-        # Calculate the elapsed time
-        elapsed_time = card_claimed_time - image_received_time
-        logging.info(f"⏱️ Time from image received to card claimed: {elapsed_time:.2f} seconds")
-    else:
-        logging.warning("⚠️ No card was chosen to be claimed.")
+            logging.warning("⚠️ No card was chosen to be claimed.")
+
+
 
 # Create Discum client
 bot = discum.Client(token=TOKEN, log=False)
@@ -399,28 +444,41 @@ def on_message(resp):
     author_id = str(data.get("author", {}).get("id"))
     channel_id = str(data.get('channel_id'))
     guild_id = str(data.get("guild_id"))
+
+    # 🚫 Ignore messages not from Sofi bot
     if author_id != SOFI_BOT_ID:
-        return  # 🚫 Ignore anything not from Sofi bot
+        return
 
     attachments = data.get("attachments", [])
     components = data.get("components", [])
 
-    # 💡 Only set this if it's from Sofi
-    if components and len(components) > 0:
-        LAST_DROP_MESSAGE_ID = data.get("id")
-        logging.debug(f"💾 LAST_DROP_MESSAGE_ID set to {LAST_DROP_MESSAGE_ID}")
+    if not attachments or not components:
+        return
 
+    if components and len(components) > 0:
+        with last_drop_id_lock:
+            LAST_DROP_MESSAGE_ID = data.get("id")
+            logging.debug(f"💾 LAST_DROP_MESSAGE_ID set to {LAST_DROP_MESSAGE_ID}")
+
+    def process_sofi_drop(attachment_url, components, channel_id, guild_id):
+        try:
+            response = session.get(attachment_url)
+            image = Image.open(BytesIO(response.content)).convert("RGB")
+            image_received_time = time.time()
+            click_bouquet_then_best_from_image(image, components, image_received_time, channel_id, guild_id)
+        except Exception as e:
+            logging.warning(f"⚠️ Failed to process image: {e}")
+
+    # Process each image attachment in a separate thread
     for attachment in attachments:
         filename = attachment.get('filename', '')
         if any(filename.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]):
-            try:
-                response = session.get(attachment.get('url'))
-                image = Image.open(BytesIO(response.content)).convert("RGB")
-                image_received_time = time.time()
-                click_bouquet_then_best_from_image(image, components, image_received_time, channel_id, guild_id)
-            except Exception as e:
-                logging.warning(f"⚠️ Failed to process image: {e}")
-            return
+            thread = threading.Thread(
+                target=process_sofi_drop,
+                args=(attachment.get('url'), components, channel_id, guild_id),
+                daemon=True
+            )
+            thread.start()
         
 def signal_handler(sig, frame):
     """Handle termination signals to gracefully shutdown."""
