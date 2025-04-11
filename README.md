@@ -47,7 +47,7 @@ This tool detects dropped cards, analyzes image content, and automatically claim
 - 🧪 `OpenCV` – Template matching
 - 🖼️ `Pillow` – Image processing
 - 🌐 `requests` – API communication
-- 🔐 `dotenv` – Manage tokens and secrets
+- 🔐 `dotenv` – Manage tokens and user data
 
 ---
 
