@@ -43,7 +43,7 @@ WATCHDOG_TIMEOUT = 510  # seconds
 
 # Initialize logging with timestamps
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
@@ -193,16 +193,20 @@ def extract_generation_with_easyocr(image):
 
     def clean_generation_text(ocr_results):
         cleaned_generations = {}
-        logging.debug(f"🔍 Raw OCR Results: {ocr_results}")
-
         for text in ocr_results:
             if len(cleaned_generations) >= 3:
                 break
 
             original_text = text.strip()
-            text = re.sub(r'[^a-zA-Z0-9]', '', original_text)
+            text_upper = original_text.upper()
 
-            # Apply replacements only for generation
+            match_6g = re.match(r"^6G(\d{1,4})$", text_upper)
+            if match_6g:
+                gen_number = f"G{match_6g.group(1)}"
+                cleaned_generations[gen_number] = int(match_6g.group(1))
+                continue
+
+            text = re.sub(r'[^a-zA-Z0-9]', '', original_text)
             text = text.replace("i", "1").replace("I", "1") \
                        .replace("o", "0").replace("O", "0") \
                        .replace("g", "9").replace("s", "5").replace("S", "5") \
@@ -211,10 +215,6 @@ def extract_generation_with_easyocr(image):
             if text.startswith(("0", "6", "5", "9")) and not text.upper().startswith("G"):
                 text = "G" + text[1:]
 
-             # Fix leading digit + G (e.g., 6G1914 -> G1914)
-            if re.match(r'^\dG\d+$', text.upper()):
-                text = "G" + text[2:]
-
             match = re.match(r'^G(\d{1,4})$', text.upper())
             if match:
                 gen_number = f"G{match.group(1)}"
@@ -222,62 +222,49 @@ def extract_generation_with_easyocr(image):
                 logging.debug(f"✅ Final Processed: {original_text} → {gen_number}")
             else:
                 logging.debug(f"❌ Rejected: {original_text} → {text}")
-
         logging.debug(f"🚀 FINAL NORMALIZED GENERATIONS: {cleaned_generations}")
         return cleaned_generations
 
-    def extract_card_name_and_series(ocr_results):
+    def extract_card_name_and_series_from_full_text(ocr_results, cleaned_generations):
         logging.debug(f"🔍 Raw OCR Results: {ocr_results}")
-        try:
-            if not ocr_results or len(ocr_results) < 2:
-                return "", ""
+        if not ocr_results or len(ocr_results) < 2:
+            return None, None
 
-            gen_index = -1
-            for i, text in enumerate(ocr_results):
-                if clean_generation_text([text]):
-                    gen_index = i
-                    break
+        gen_index = -1
+        for i, text in enumerate(ocr_results):
+            if clean_generation_text([text]):
+                gen_index = i
+                break
 
-            if gen_index == -1:
-                return "", ""
+        if gen_index == -1 or gen_index + 1 >= len(ocr_results):
+            return None, None
 
-            name = ocr_results[gen_index + 1].strip() if gen_index + 1 < len(ocr_results) else ""
-            series = ocr_results[gen_index + 2].strip() if gen_index + 2 < len(ocr_results) else ""
+        name = ocr_results[gen_index + 1].strip()
+        series = ocr_results[gen_index + 2].strip() if gen_index + 2 < len(ocr_results) else None
+        logging.debug(f"🧹 Card Name: {name}")
+        logging.debug(f"🧹 Series Name: {series}")
+        return name, series
 
-            logging.debug(f"🧹 Card Name: {name}")
-            logging.debug(f"🧹 Series Name: {series}")
-            return name, series
+    if isinstance(image, Image.Image):
+        image = np.array(image)
 
-        except Exception as e:
-            logging.warning(f"⚠️ Error extracting name and series: {e}")
-            return "", ""
+    target_width = 300
+    scale_ratio = target_width / image.shape[1]
+    image = cv2.resize(image, (target_width, int(image.shape[0] * scale_ratio)), interpolation=cv2.INTER_AREA)
 
-    try:
-        # Convert PIL to array
-        if isinstance(image, Image.Image):
-            image = np.array(image)
+    if len(image.shape) == 2 or image.shape[2] == 1:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
-        target_width = 300
-        scale_ratio = target_width / image.shape[1]
-        image = cv2.resize(image, (target_width, int(image.shape[0] * scale_ratio)), interpolation=cv2.INTER_AREA)
+    extracted_text = reader.readtext(image, detail=0, batch_size=2)
 
-        if len(image.shape) == 2 or image.shape[2] == 1:
-            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    generations = clean_generation_text(extracted_text)
+    name, series = extract_card_name_and_series_from_full_text(extracted_text, generations)
 
-        extracted_text = reader.readtext(image, detail=0, batch_size=2)
-        logging.debug(f"🔍 EasyOCR Raw Extracted: {extracted_text}")
+    time_taken = time.time() - start_time
+    logging.debug(f"⏱️ Time taken for extract_generation_with_easyocr: {time_taken:.2f} seconds")
 
-        generations = clean_generation_text(extracted_text)
-        name, series = extract_card_name_and_series(extracted_text)
+    return generations, name, series
 
-        time_taken = time.time() - start_time
-        logging.debug(f"⏱️ Time taken for extract_generation_with_easyocr: {time_taken:.2f} seconds")
-
-        return generations, name, series
-
-    except Exception as e:
-        logging.warning(f"⚠️ OCR failed in extract_generation_with_easyocr: {e}")
-        return {}, "", ""
 
 def extract_card_for_index(index, card_crop):
     try:
@@ -374,6 +361,17 @@ def find_best_character_match(name, series):
             likes = matched_entry.get("likes", 0)
             matched_name = matched_entry.get("full_name", match_string)
             matched_series = matched_entry.get("series", "Unknown")
+
+            # If the fuzzy match score is too low, attempt prefix match fallback
+            if score < 90 and series:
+                for idx, entry in enumerate(TOP_CHARACTERS_LIST):
+                    if entry.get("character", "").upper() == name.upper():
+                        leaderboard_series = entry.get("series", "")
+                        truncated_len = len(series.strip())
+                        if leaderboard_series[:truncated_len].upper() == series.upper():
+                            matched_name = entry.get("full_name") or f"{entry.get('character', '')} {leaderboard_series}"
+                            logging.info(f"🧩 Prefix match fallback: {matched_name} for {name} + {series}")
+                            return 90, idx, entry.get("likes", 0), matched_name, leaderboard_series
 
             return score, leaderboard_idx, likes, matched_name, matched_series
 
@@ -581,11 +579,7 @@ def on_message(resp):
         expected_fight = f"<@{pending_claim['user_id']}> fought off"
         starts_with_grab = content.startswith(expected_grab)
         starts_with_fight = content.startswith(expected_fight)
-
-        logging.debug(f"🧾 Checking if content starts with '{expected_grab}': {starts_with_grab}")
-        logging.debug(f"🧾 Checking if content starts with '{expected_fight}': {starts_with_fight}")
-        logging.debug(f"🧾 Final IF result: {starts_with_grab or starts_with_fight}")
-
+        
         if starts_with_grab or starts_with_fight:
             logging.info(f"🎉 Claim confirmed: {content}")
             with last_processed_time_lock:
