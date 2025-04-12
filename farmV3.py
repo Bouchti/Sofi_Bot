@@ -357,7 +357,7 @@ def find_best_character_match(name, series):
 
                 logging.debug(f"🧪 Series match attempt: {series} ↔ {series_val} = {series_score}")
 
-                if series_score >= 60:
+                if series_score >= 70:
                     if character_score > best_score or (character_score == best_score and likes > best_likes):
                         best_score = character_score
                         best_entry = entry
