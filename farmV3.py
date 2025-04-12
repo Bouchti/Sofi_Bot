@@ -43,7 +43,7 @@ WATCHDOG_TIMEOUT = 510  # seconds
 
 # Initialize logging with timestamps
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
@@ -147,39 +147,49 @@ def preprocess_string(s):
     tokens = re.sub(r'[^a-zA-Z0-9\s]', ' ', s).upper().split()
     return ' '.join(sorted(tokens))
 
-def load_top_characters():
-    try:
-        with open("sofi_leaderboard.json", "r", encoding="utf-8") as f:
-            raw_data = json.load(f)
+def load_top_characters(json_path):
+    import json
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-            if isinstance(raw_data, list):
-                entries = raw_data
-            else:
-                entries = raw_data.get("data", [])
+    cleaned = []
+    for idx, entry in enumerate(data):
+        if isinstance(entry, set):
+            logging.warning(f"⚠️ Skipping set entry in leaderboard (#{idx}): {entry}")
+            continue
 
-            processed = []
-            for entry in entries:
-                char_name = entry.get("character")
-                series = entry.get("series")
-                likes = entry.get("likes", 0)
+        if isinstance(entry, list):
+            logging.warning(f"⚠️ Skipping list entry in leaderboard (#{idx}): {entry}")
+            continue
 
-                if not char_name or not series:
-                    logging.warning("⚠️ Entry missing 'character' or 'series' key, skipping entry.")
+        if not isinstance(entry, dict):
+            logging.warning(f"⚠️ Skipping non-dict entry in leaderboard (#{idx}): {entry}")
+            continue
+
+        if "character" not in entry or "series" not in entry:
+            full_name = entry.get("full_name", "").strip()
+            if full_name:
+                parts = full_name.split()
+                if len(parts) >= 2:
+                    entry["character"] = " ".join(parts[:-1])
+                    entry["series"] = parts[-1]
+                else:
+                    logging.warning(f"⚠️ Unable to split full_name (#{idx}): {full_name}")
                     continue
+            else:
+                logging.warning(f"⚠️ Missing 'character' and no valid 'full_name' (#{idx}): {entry}")
+                continue
 
-                combined = preprocess_string(f"{char_name} - {series}")
-                processed.append({
-                    "full_name": combined,
-                    "likes": likes
-                })
+        if "full_name" not in entry:
+            entry["full_name"] = f"{entry['character']} {entry['series']}"
 
-            processed_set = {entry["full_name"] for entry in processed}
-            return processed, processed_set
-    except FileNotFoundError:
-        logging.warning("⚠️ 'sofi_leaderboard.json' not found.")
-        return [], set()
+        cleaned.append(entry)
+
+    logging.info(f"✅ Loaded {len(cleaned)} top characters.")
+    return cleaned, {e["character"].lower() for e in cleaned if isinstance(e, dict) and "character" in e}
+
     
-TOP_CHARACTERS_LIST, TOP_CHARACTERS_SET = load_top_characters()
+TOP_CHARACTERS_LIST, TOP_CHARACTERS_SET = load_top_characters("sofi_leaderboard.json")
 
 def preprocess_image(image):
     if isinstance(image, Image.Image):
@@ -193,6 +203,8 @@ def extract_generation_with_easyocr(image):
 
     def clean_generation_text(ocr_results):
         cleaned_generations = {}
+        logging.debug(f"🔍 Raw OCR Results: {ocr_results}")
+
         for text in ocr_results:
             if len(cleaned_generations) >= 3:
                 break
@@ -200,32 +212,37 @@ def extract_generation_with_easyocr(image):
             original_text = text.strip()
             text_upper = original_text.upper()
 
+            # Handle 6Gxxxx format properly
             match_6g = re.match(r"^6G(\d{1,4})$", text_upper)
             if match_6g:
                 gen_number = f"G{match_6g.group(1)}"
                 cleaned_generations[gen_number] = int(match_6g.group(1))
+                logging.debug(f"✅ Special Format: {original_text} → {gen_number}")
                 continue
 
-            text = re.sub(r'[^a-zA-Z0-9]', '', original_text)
-            text = text.replace("i", "1").replace("I", "1") \
-                       .replace("o", "0").replace("O", "0") \
-                       .replace("g", "9").replace("s", "5").replace("S", "5") \
-                       .replace("B", "8").replace("l", "1")
+            text_clean = re.sub(r'[^a-zA-Z0-9]', '', original_text)
 
-            if text.startswith(("0", "6", "5", "9")) and not text.upper().startswith("G"):
-                text = "G" + text[1:]
+            # ONLY apply substitutions to generation string
+            text_clean = text_clean.replace("i", "1").replace("I", "1") \
+                                   .replace("o", "0").replace("O", "0") \
+                                   .replace("g", "9").replace("s", "5").replace("S", "5") \
+                                   .replace("B", "8").replace("l", "1")
 
-            match = re.match(r'^G(\d{1,4})$', text.upper())
+            if text_clean.startswith(("0", "6", "5", "9")) and not text_clean.upper().startswith("G"):
+                text_clean = "G" + text_clean[1:]
+
+            match = re.match(r'^G(\d{1,4})$', text_clean.upper())
             if match:
                 gen_number = f"G{match.group(1)}"
                 cleaned_generations[gen_number] = int(match.group(1))
                 logging.debug(f"✅ Final Processed: {original_text} → {gen_number}")
             else:
-                logging.debug(f"❌ Rejected: {original_text} → {text}")
+                logging.debug(f"❌ Rejected: {original_text} → {text_clean}")
+
         logging.debug(f"🚀 FINAL NORMALIZED GENERATIONS: {cleaned_generations}")
         return cleaned_generations
 
-    def extract_card_name_and_series_from_full_text(ocr_results, cleaned_generations):
+    def extract_card_name_and_series(ocr_results):
         logging.debug(f"🔍 Raw OCR Results: {ocr_results}")
         if not ocr_results or len(ocr_results) < 2:
             return None, None
@@ -241,6 +258,7 @@ def extract_generation_with_easyocr(image):
 
         name = ocr_results[gen_index + 1].strip()
         series = ocr_results[gen_index + 2].strip() if gen_index + 2 < len(ocr_results) else None
+
         logging.debug(f"🧹 Card Name: {name}")
         logging.debug(f"🧹 Series Name: {series}")
         return name, series
@@ -256,14 +274,16 @@ def extract_generation_with_easyocr(image):
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
     extracted_text = reader.readtext(image, detail=0, batch_size=2)
+    logging.debug(f"🔍 EasyOCR Raw Extracted: {extracted_text}")
 
     generations = clean_generation_text(extracted_text)
-    name, series = extract_card_name_and_series_from_full_text(extracted_text, generations)
+    name, series = extract_card_name_and_series(extracted_text)
 
     time_taken = time.time() - start_time
     logging.debug(f"⏱️ Time taken for extract_generation_with_easyocr: {time_taken:.2f} seconds")
 
     return generations, name, series
+
 
 
 def extract_card_for_index(index, card_crop):
@@ -309,76 +329,53 @@ def extract_card_generations(image):
 
 def find_best_character_match(name, series):
     if not name:
+        logging.debug("🚫 No name provided, skipping match.")
         return None, 0, 0, None, None
 
     try:
-        raw = f"{name} {series}".strip()
-        normalized = preprocess_string(raw)
+        logging.debug(f"🧠 Trying to match character '{name}' with series '{series}'")
 
-        full_names = []
-        index_map = []
+        best_entry = None
+        best_score = -1
+        best_likes = -1
+        matched_series = None
+        matched_index = 0
 
         for idx, entry in enumerate(TOP_CHARACTERS_LIST):
-            if not isinstance(entry, dict):
-                logging.warning(f"⚠️ Skipping non-dict entry in leaderboard: {entry}")
-                continue
-
             character = entry.get("character", "")
             series_val = entry.get("series", "")
-            full_name = entry.get("full_name")
+            full_name = entry.get("full_name", f"{character} {series_val}")
+            likes = entry.get("likes", 0)
 
-            # Fallback: construct full_name safely
-            if not full_name:
-                parts = []
-                if character:
-                    parts.append(character)
-                if series_val:
-                    parts.append(series_val)
-                full_name = " ".join(parts).strip()
+            character_score = fuzz.ratio(name.lower(), character.lower())
 
-            if not full_name:
-                logging.warning(f"⚠️ Skipping entry due to missing name and series: {entry}")
-                continue
+            if character_score >= 95:
+                # Check series similarity only if character matched well
+                truncated_series_len = len(series.strip())
+                series_prefix = series_val[:truncated_series_len]
+                series_score = fuzz.ratio(series_prefix.lower(), series.lower())
 
-            full_names.append(preprocess_string(full_name))
-            index_map.append(idx)
+                logging.debug(f"🧪 Series match attempt: {series} ↔ {series_val} = {series_score}")
 
-        if not full_names:
-            logging.warning("⚠️ No valid entries in leaderboard to match against.")
-            return None, 0, 0, None, None
+                if series_score >= 60:
+                    if character_score > best_score or (character_score == best_score and likes > best_likes):
+                        best_score = character_score
+                        best_entry = entry
+                        best_likes = likes
+                        matched_series = series_val
+                        matched_index = idx
 
-        best_match = process.extractOne(
-            normalized,
-            full_names,
-            scorer=fuzz.token_sort_ratio
-        )
+        if best_entry:
+            matched_name = best_entry.get("full_name", f"{best_entry['character']} {matched_series}")
+            logging.info(f"🎯 Match found: {matched_name} ({best_score}% character, ❤️ {best_likes})")
+            return best_score, matched_index, best_likes, matched_name, matched_series
 
-        if best_match:
-            match_string, score, match_idx = best_match
-            leaderboard_idx = index_map[match_idx]
-            matched_entry = TOP_CHARACTERS_LIST[leaderboard_idx]
-
-            likes = matched_entry.get("likes", 0)
-            matched_name = matched_entry.get("full_name", match_string)
-            matched_series = matched_entry.get("series", "Unknown")
-
-            # If the fuzzy match score is too low, attempt prefix match fallback
-            if score < 90 and series:
-                for idx, entry in enumerate(TOP_CHARACTERS_LIST):
-                    if entry.get("character", "").upper() == name.upper():
-                        leaderboard_series = entry.get("series", "")
-                        truncated_len = len(series.strip())
-                        if leaderboard_series[:truncated_len].upper() == series.upper():
-                            matched_name = entry.get("full_name") or f"{entry.get('character', '')} {leaderboard_series}"
-                            logging.info(f"🧩 Prefix match fallback: {matched_name} for {name} + {series}")
-                            return 90, idx, entry.get("likes", 0), matched_name, leaderboard_series
-
-            return score, leaderboard_idx, likes, matched_name, matched_series
+        logging.debug("❌ No character+series match found with high confidence.")
+        return None, 0, 0, None, None
 
     except Exception as e:
         logging.warning(f"⚠️ Match failed for {name} - {series}: {e}")
-
-    return None, 0, 0, None, None
+        return None, 0, 0, None, None
 
 def click_bouquet_then_best_from_image(pil_image, buttons_components, image_received_time, channel_id, guild_id):
     logging.info("🧠 Starting processing of the Sofi card image...")
@@ -427,23 +424,18 @@ def click_bouquet_then_best_from_image(pil_image, buttons_components, image_rece
         generations = info.get('generations', {})
 
         if name and series:
-            # Cut the length of series to match the OCR-truncated version
-            truncated_series = series.strip()
-            for entry in TOP_CHARACTERS_LIST:
-                if entry.get("character", "") == name:
-                    expected_series = entry["series"]
-                    match = find_best_character_match(name, expected_series[:len(truncated_series)])
-                    if match:
-                        score, _, likes, matched_name, matched_series = match
-                        if score is not None and score >= 85:
-                            if score > best_score or (score == best_score and likes > best_likes):
-                                best_score = score
-                                best_likes = likes
-                                best_match_index = i
-                                best_match_name = matched_name
-                                best_match_series = matched_series
-                        else:
-                            logging.debug(f"🔸 Skipped weak match: {matched_name} (score: {score:.2f})")
+            match = find_best_character_match(name, series)
+            if match:
+                score, _, likes, matched_name, matched_series = match
+                if score is not None and score >= 60:
+                    if score > best_score or (score == best_score and likes > best_likes):
+                        best_score = score
+                        best_likes = likes
+                        best_match_index = i
+                        best_match_name = matched_name
+                        best_match_series = matched_series
+                else:
+                  logging.debug(f"🔸 Skipped weak match: {matched_name} (score: {score if score is not None else 'N/A'})")
 
         if generations:
             gen_value = min(generations.values())
@@ -464,19 +456,19 @@ def click_bouquet_then_best_from_image(pil_image, buttons_components, image_rece
     generations = card_info.get(chosen_index, {}).get('generations', {})
 
     if generations:
-      with last_processed_time_lock:
-        cooldown_active = (
-            last_processed_time and
-            (now - last_processed_time < PROCESS_COOLDOWN_SECONDS)
-        )
-        pending_active = pending_claim.get("triggered", False)
+        with last_processed_time_lock:
+            cooldown_active = (
+                last_processed_time and
+                (now - last_processed_time < PROCESS_COOLDOWN_SECONDS)
+            )
+            pending_active = pending_claim.get("triggered", False)
 
-        if generations and (pending_active or cooldown_active):
-            if pending_active:
-                logging.info("⏱️ Skipping claim — waiting for confirmation of previous claim.")
-            elif cooldown_active:
-                logging.info("⏱️ Skipping claim — cooldown period not yet expired.")
-            return
+            if generations and (pending_active or cooldown_active):
+                if pending_active:
+                    logging.info("⏱️ Skipping claim — waiting for confirmation of previous claim.")
+                elif cooldown_active:
+                    logging.info("⏱️ Skipping claim — cooldown period not yet expired.")
+                return
 
     if chosen_index is not None:
         click_discord_button(button_ids[chosen_index], channel_id, guild_id)
@@ -495,7 +487,6 @@ def click_bouquet_then_best_from_image(pil_image, buttons_components, image_rece
         logging.info(f"⏱️ Time to claim: {elapsed_time:.2f} seconds")
     else:
         logging.warning("⚠️ No card was chosen to be claimed.")
-
 
 
 # Create Discum client
@@ -579,7 +570,7 @@ def on_message(resp):
         expected_fight = f"<@{pending_claim['user_id']}> fought off"
         starts_with_grab = content.startswith(expected_grab)
         starts_with_fight = content.startswith(expected_fight)
-        
+
         if starts_with_grab or starts_with_fight:
             logging.info(f"🎉 Claim confirmed: {content}")
             with last_processed_time_lock:
