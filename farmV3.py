@@ -337,10 +337,10 @@ def find_best_character_match(name, series):
                 
             if name_score > 95:
                 if len(series_name) <= 4:
-                    series_score = fuzz.ratio(normalized_name, series_name)
+                    series_score = fuzz.ratio(normalized_series, series_name)
                 else:
-                    series_score = fuzz.partial_ratio(normalized_name, series_name)
-                    
+                    series_score = fuzz.partial_ratio(normalized_series, series_name)
+
                 logging.info(f"🔍 Candidate: {entry.get('character')} - Name Score: {name_score}, Series Score: {series_score}")
 
                 if series_score > 85 and name_score + series_score > best_score + best_series_score:
