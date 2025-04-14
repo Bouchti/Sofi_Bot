@@ -313,53 +313,52 @@ def extract_card_generations(image):
 
 def find_best_character_match(name, series):
     if not name:
-        logging.debug("🚫 No name provided, skipping match.")
         return None, 0, 0, None, None
 
     try:
-        logging.debug(f"🧠 Trying to match character '{name}' with series '{series}'")
+        # Remove trailing '-' from OCR results only
+        normalized_name = preprocess_string(name.rstrip("-"))
+        normalized_series = preprocess_string(series.rstrip("-"))
 
         best_entry = None
-        best_score = -1
-        best_likes = -1
-        matched_series = None
-        matched_index = 0
+        best_score = 0
+        best_series_score = 0
+        best_index = 0
 
         for idx, entry in enumerate(TOP_CHARACTERS_LIST):
-            character = entry.get("character", "")
-            series_val = entry.get("series", "")
-            full_name = entry.get("full_name", f"{character} {series_val}")
-            likes = entry.get("likes", 0)
+            character = preprocess_string(entry.get("character", ""))
+            series_name = preprocess_string(entry.get("series", ""))
 
-            character_score = fuzz.ratio(name.lower(), character.lower())
+            # Mitigate very short character names (1-3 characters)
+            if len(character) <= 4:
+                name_score = fuzz.ratio(normalized_name, character)
+            else:
+                name_score = fuzz.partial_ratio(normalized_name, character)
+                
+            if name_score > 95:
+                if len(series_name) <= 4:
+                    series_score = fuzz.ratio(normalized_name, series_name)
+                else:
+                    series_score = fuzz.partial_ratio(normalized_name, series_name)
+                    
+                logging.info(f"🔍 Candidate: {entry.get('character')} - Name Score: {name_score}, Series Score: {series_score}")
 
-            if character_score >= 95:
-                # Check series similarity only if character matched well
-                truncated_series_len = len(series.strip())
-                series_prefix = series_val[:truncated_series_len]
-                series_score = fuzz.ratio(series_prefix.lower(), series.lower())
-
-                logging.debug(f"🧪 Series match attempt: {series} ↔ {series_val} = {series_score}")
-
-                if series_score >= 70:
-                    if character_score > best_score or (character_score == best_score and likes > best_likes):
-                        best_score = character_score
-                        best_entry = entry
-                        best_likes = likes
-                        matched_series = series_val
-                        matched_index = idx
+                if series_score > 85 and name_score + series_score > best_score + best_series_score:
+                    best_score = name_score
+                    best_series_score = series_score
+                    best_entry = entry
+                    best_index = idx
 
         if best_entry:
-            matched_name = best_entry.get("full_name", f"{best_entry['character']} {matched_series}")
-            logging.info(f"🎯 Match found: {matched_name} ({best_score}% character, ❤️ {best_likes})")
-            return best_score, matched_index, best_likes, matched_name, matched_series
-
-        logging.debug("❌ No character+series match found with high confidence.")
-        return None, 0, 0, None, None
+            full_name = best_entry.get("full_name") or f"{best_entry['character']} {best_entry['series']}"
+            return best_score, best_index, best_entry.get("likes", 0), full_name, best_entry.get("series")
 
     except Exception as e:
         logging.warning(f"⚠️ Match failed for {name} - {series}: {e}")
-        return None, 0, 0, None, None
+
+    return None, 0, 0, None, None
+
+
 
 def click_bouquet_then_best_from_image(pil_image, buttons_components, image_received_time, channel_id, guild_id,m,buttons):
     logging.info("🧠 Starting processing of the Sofi card image...")
