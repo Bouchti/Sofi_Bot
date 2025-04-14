@@ -18,6 +18,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 import json
 from threading import Lock
+from discum.utils.button import Buttoner
 
 last_drop_id_lock = Lock()
 last_processed_time_lock = Lock()
@@ -45,7 +46,11 @@ WATCHDOG_TIMEOUT = 510  # seconds
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler("Sofi_bot.log", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout)
+    ]
 )
 logging.getLogger("websocket").setLevel(logging.CRITICAL)
 logging.getLogger("discum.gateway.gateway").setLevel(logging.ERROR)
@@ -104,44 +109,23 @@ def periodic_sd_sender(bot, stop_event):
             logging.info("📤 Sent 'sd' command.")
         except Exception as e:
             logging.exception("⚠️ Failed to send 'sd'")
-def click_discord_button(custom_id, channel_id, guild_id):
-    with last_drop_id_lock:
-        message_id = LAST_DROP_MESSAGE_ID
-
-    if not message_id or len(message_id) < 15:
-        logging.warning("❌ Not sending interaction: Invalid or missing message ID.")
-        return
-
-    url = "https://discord.com/api/v9/interactions"
-    headers = {
-        "Authorization": TOKEN,
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "type": 3,
-        "guild_id": guild_id,
-        "channel_id": channel_id,  # 👈 Use dynamic channel_id
-        "message_id": message_id ,
-        "application_id": "853629533855809596",  # Sofi
-        "session_id": bot.gateway.session_id,
-        "data": {
-            "component_type": 2,
-            "custom_id": custom_id
-        }
-    }
-    logging.debug(f"""
-📤   Preparing interaction payload:
-     Message ID : {LAST_DROP_MESSAGE_ID}
-     Channel ID : {channel_id}
-     Guild ID   : {guild_id}
-     Session ID : {bot.gateway.session_id}
-    """)
-    response = session.post(url, json=payload, headers=headers)
-    if response.status_code == 204:
-        logging.info(f"✅ Successfully clicked button with ID: {custom_id}")
-    else:
-        logging.warning(f"❌ Failed to click button. Status: {response.status_code}, Response: {response.text}")
+def click_discord_button(custom_id, channel_id, guild_id,m,buttons):
+    try:
+        logging.debug(f"🔔 Using bot.click with custom_id={custom_id}")
+        bot.click(
+            applicationID=m['author']['id'],
+            channelID=channel_id,
+            guildID=m.get("guild_id"),
+            messageID=m["id"],
+            messageFlags=m["flags"],
+            data={
+                "component_type": 2,
+                "custom_id": custom_id
+            }
+        )
+        logging.info(f"✅ Dispatched click for button {custom_id}")
+    except Exception as e:
+        logging.warning(f"❌ Exception during click: {e}")
 
 def preprocess_string(s):
     tokens = re.sub(r'[^a-zA-Z0-9\s]', ' ', s).upper().split()
@@ -189,7 +173,7 @@ def load_top_characters(json_path):
     return cleaned, {e["character"].lower() for e in cleaned if isinstance(e, dict) and "character" in e}
 
     
-TOP_CHARACTERS_LIST, TOP_CHARACTERS_SET = load_top_characters("sofi_leaderboard.json")
+TOP_CHARACTERS_LIST, TOP_CHARACTERS_SET = load_top_characters("sofi_leaderboard_extended.json")
 
 def preprocess_image(image):
     if isinstance(image, Image.Image):
@@ -377,7 +361,7 @@ def find_best_character_match(name, series):
         logging.warning(f"⚠️ Match failed for {name} - {series}: {e}")
         return None, 0, 0, None, None
 
-def click_bouquet_then_best_from_image(pil_image, buttons_components, image_received_time, channel_id, guild_id):
+def click_bouquet_then_best_from_image(pil_image, buttons_components, image_received_time, channel_id, guild_id,m,buttons):
     logging.info("🧠 Starting processing of the Sofi card image...")
     card_count = 3
     button_ids = [
@@ -399,7 +383,7 @@ def click_bouquet_then_best_from_image(pil_image, buttons_components, image_rece
     for i in range(card_count):
         generations = card_info.get(i, {}).get('generations', {})
         if not generations:
-            click_discord_button(button_ids[i], channel_id, guild_id)
+            click_discord_button(button_ids[i], channel_id, guild_id,m,buttons)
             card_claimed_time = time.time()
             elapsed_time = card_claimed_time - image_received_time
             time.sleep(3)
@@ -471,7 +455,7 @@ def click_bouquet_then_best_from_image(pil_image, buttons_components, image_rece
                 return
 
     if chosen_index is not None:
-        click_discord_button(button_ids[chosen_index], channel_id, guild_id)
+        click_discord_button(button_ids[chosen_index], channel_id, guild_id,m,buttons)
         pending_claim["timestamp"] = now
         pending_claim["triggered"] = True
         pending_claim["user_id"] = USER_ID
@@ -543,6 +527,8 @@ def on_message(resp):
         return
 
     data = resp.raw['d']
+    m = resp.parsed.auto()
+    butts = Buttoner(m["components"])
     author_id = str(data.get("author", {}).get("id"))
     channel_id = str(data.get('channel_id'))
     guild_id = str(data.get("guild_id"))
@@ -594,7 +580,7 @@ def on_message(resp):
             response = session.get(attachment_url)
             image = Image.open(BytesIO(response.content)).convert("RGB")
             image_received_time = time.time()
-            click_bouquet_then_best_from_image(image, components, image_received_time, channel_id, guild_id)
+            click_bouquet_then_best_from_image(image, components, image_received_time, channel_id, guild_id,m,butts)
         except Exception as e:
             logging.warning(f"⚠️ Failed to process image: {e}")
 

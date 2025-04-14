@@ -15,8 +15,8 @@ with mss.mss() as sct:
 logging.basicConfig(level=logging.DEBUG)
 
 # Constants
-TOTAL_PAGES = 150
-OUTPUT_FILE = "sofi_leaderboard.json"
+TOTAL_PAGES = 300
+OUTPUT_FILE = "sofi_leaderboard_extended.json"
 message_position = (600, 600)  # Position of SWLB message
 
 # Coordinates (adjust with pyautogui.position())
@@ -93,7 +93,7 @@ def run_scraper():
 
         if page < TOTAL_PAGES:
             go_to_next_page()
-            time.sleep(2)
+            time.sleep(3)
 
     print("🎉 Done! All pages processed.")
 
