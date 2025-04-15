@@ -302,7 +302,7 @@ def extract_card_generations(image):
                         'name': name or "",
                         'series': series or ""
                     }
-                    logging.debug(f"✅ Card {i}: Gen: {gens}, Name: {name}, Series: {series}")
+                    logging.info(f"✅ Card {i}: Gen: {gens}, Name: {name}, Series: {series}")
                 else:
                     logging.debug(f"❌ No valid data for card {i}")
             except Exception as e:
@@ -326,8 +326,8 @@ def find_best_character_match(name, series):
         best_index = 0
 
         for idx, entry in enumerate(TOP_CHARACTERS_LIST):
-            character = preprocess_string(entry.get("character", ""))
-            series_name = preprocess_string(entry.get("series", ""))
+            character = preprocess_string(entry.get("character", "").rstrip("...").rstrip("-"))
+            series_name = preprocess_string(entry.get("series", "").rstrip("...").rstrip("-"))
 
             # Mitigate very short character names (1-3 characters)
             if len(character) <= 4:
@@ -335,7 +335,7 @@ def find_best_character_match(name, series):
             else:
                 name_score = fuzz.partial_ratio(normalized_name, character)
                 
-            if name_score > 95:
+            if name_score > 85:
                 if len(series_name) <= 4:
                     series_score = fuzz.ratio(normalized_series, series_name)
                 else:
