@@ -360,7 +360,7 @@ def find_best_character_match(name, series):
 
 
 
-def click_bouquet_then_best_from_image(pil_image, buttons_components, image_received_time, channel_id, guild_id,m,buttons):
+def click_bouquet_then_best_from_image(pil_image, buttons_components, image_received_time, channel_id, guild_id, m, buttons):
     logging.info("🧠 Starting processing of the Sofi card image...")
     card_count = 3
     button_ids = [
@@ -382,7 +382,7 @@ def click_bouquet_then_best_from_image(pil_image, buttons_components, image_rece
     for i in range(card_count):
         generations = card_info.get(i, {}).get('generations', {})
         if not generations:
-            click_discord_button(button_ids[i], channel_id, guild_id,m,buttons)
+            click_discord_button(button_ids[i], channel_id, guild_id, m, buttons)
             card_claimed_time = time.time()
             elapsed_time = card_claimed_time - image_received_time
             time.sleep(3)
@@ -396,6 +396,7 @@ def click_bouquet_then_best_from_image(pil_image, buttons_components, image_rece
     best_match_series = None
     lowest_gen_index = None
     lowest_gen_value = float('inf')
+    gen_below_10_index = None
 
     for i in range(card_count):
         if i in claimed_indexes or i not in card_info:
@@ -418,10 +419,12 @@ def click_bouquet_then_best_from_image(pil_image, buttons_components, image_rece
                         best_match_name = matched_name
                         best_match_series = matched_series
                 else:
-                  logging.debug(f"🔸 Skipped weak match: {matched_name} (score: {score if score is not None else 'N/A'})")
+                    logging.debug(f"🔸 Skipped weak match: {matched_name} (score: {score if score is not None else 'N/A'})")
 
         if generations:
             gen_value = min(generations.values())
+            if gen_value < 10 and gen_below_10_index is None:
+                gen_below_10_index = i
             if gen_value < lowest_gen_value:
                 lowest_gen_value = gen_value
                 lowest_gen_index = i
@@ -430,7 +433,8 @@ def click_bouquet_then_best_from_image(pil_image, buttons_components, image_rece
         logging.info(f"🔎 Best match: {best_match_name} from {best_match_series} with ❤️ {best_likes} likes (score: {best_score})")
 
     chosen_index = (
-        best_match_index if best_match_index is not None
+        gen_below_10_index if gen_below_10_index is not None
+        else best_match_index if best_match_index is not None
         else lowest_gen_index if lowest_gen_index is not None
         else next((i for i in range(card_count) if i not in claimed_indexes), None)
     )
@@ -454,7 +458,7 @@ def click_bouquet_then_best_from_image(pil_image, buttons_components, image_rece
                 return
 
     if chosen_index is not None:
-        click_discord_button(button_ids[chosen_index], channel_id, guild_id,m,buttons)
+        click_discord_button(button_ids[chosen_index], channel_id, guild_id, m, buttons)
         pending_claim["timestamp"] = now
         pending_claim["triggered"] = True
         pending_claim["user_id"] = USER_ID
@@ -464,12 +468,15 @@ def click_bouquet_then_best_from_image(pil_image, buttons_components, image_rece
 
         if best_match_index == chosen_index:
             logging.info(f"✅ Claimed card {chosen_index+1} (⭐ best match ⭐)")
+        elif gen_below_10_index == chosen_index:
+            logging.info(f"✅ Claimed card {chosen_index+1} (⚡ generation < 10 ⚡)")
         else:
             logging.info(f"✅ Claimed card {chosen_index+1} (🥱 lowest generation 🥱)")
 
         logging.info(f"⏱️ Time to claim: {elapsed_time:.2f} seconds")
     else:
         logging.warning("⚠️ No card was chosen to be claimed.")
+
 
 
 # Create Discum client
