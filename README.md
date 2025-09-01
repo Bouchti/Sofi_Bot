@@ -1,20 +1,26 @@
 # 🌾 Sofi_Bot – Automated Card Farming Bot for Sofi Discord Bot
 
-🤖 Automate your **Sofi** experience and efficiently farm cards using powerful OCR, image processing, and smart decision-making!
+🤖 Automate your Sofi experience and efficiently farm cards using OCR, image processing, and smart decision-making – now with a Graphical User Interface (GUI) for easier control!
 
 ---
 
 ## 📌 Overview
 
-**Sofi_Bot** is a smart automation bot designed to interact with the [Sofi Discord Bot](https://discord.com/invite/sofi), a popular card-collecting game.  
-This tool detects dropped cards, analyzes image content, and automatically claims the best card using intelligent logic.
+Sofi_Bot is an advanced automation bot designed for the Sofi Discord Bot, a popular card-collecting game.
+It detects card drops, analyzes images, and automatically claims the best cards using optimized logic.
+
+Choose between:
+
+⚡ CLI Mode – lightweight console-based automation
+
+🖥️ GUI Mode – user-friendly interface with start/stop buttons, logs, and settings
 
 ---
 
 ## ⚙️ Features
 
 - 🔁 **Automated Farming** – Sends the `sd` command every 8 minutes to drop cards  
-- 💐 **Bouquet Detection** – Instantly claims bouquet-style cards using template matching  
+- 💐 **event card Detection** – Instantly claims event cards 
 - 🧠 **Smart Claiming Logic**:
   - Reads card **generation numbers** and **character names**
   - Claims cards with **no generation first**
@@ -24,6 +30,7 @@ This tool detects dropped cards, analyzes image content, and automatically claim
 - 💥 **Fast & Responsive** – Multi-threaded image processing for low latency  
 - 🔄 **Self-Healing** – Automatically restarts when Discord gateway is frozen  
 - ⚙️ **Fully Configurable** – Edit filters, logic, timers, and templates easily
+- 🖥️ GUI Version – Start/stop bot, view logs, and manage settings with a clean interface
 
 ---
 
@@ -48,6 +55,7 @@ This tool detects dropped cards, analyzes image content, and automatically claim
 - 🖼️ `Pillow` – Image processing
 - 🌐 `requests` – API communication
 - 🔐 `dotenv` – Manage tokens and user data
+- 🖥️ tkinter  – GUI interface
 
 ---
 
@@ -72,7 +80,11 @@ USER_ID=your_user_id                # Optional (for logs)
 
 ### 4️⃣ Run the Bot
 
+CLI Mode (Lightweight)
 python farmV3.py
+
+GUI Mode (User-Friendly)
+python sofi_bot_gui.py
 
 ⚠️ Disclaimer
 This bot interacts with Discord’s internal API. Use responsibly.
@@ -80,8 +92,4 @@ You must not use this bot to spam, exploit, or violate Discord’s Terms of Serv
 
 Use at your own risk.
 
-📸 Screenshots
-🚧 Coming soon...
 
-🧑‍💻 Author
-Developed with ❤️ by Bouchti
