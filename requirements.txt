@@ -1,8 +1,19 @@
+# Core bot
 discum==1.4.0
-numpy
-Pillow
-python-dotenv
-requests
-opencv-python
-easyocr
-rapidfuzz
+python-dotenv>=1.0.1
+requests>=2.32.3
+
+# OCR & Image processing
+easyocr>=1.7.1
+torch==2.2.2
+torchvision==0.17.2
+torchaudio==2.2.2
+opencv-python>=4.10.0.84
+Pillow>=10.4.0
+numpy>=1.26.4
+
+# Fuzzy matching
+rapidfuzz>=3.9.6
+
+# UI
+tk  # (built-in with Python on Windows, no pip package needed, safe to omit)
