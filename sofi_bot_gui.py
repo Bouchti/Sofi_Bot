@@ -18,7 +18,7 @@ import requests
 import numpy as np
 from PIL import Image
 import cv2
-from dotenv import load_dotenv, dotenv_values
+from dotenv import load_dotenv
 from rapidfuzz import fuzz
 import easyocr
 import discum
@@ -26,7 +26,7 @@ from discum.utils.button import Buttoner
 
 # --- UI (built-in, free) ---
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox
 from tkinter.scrolledtext import ScrolledText
 
 # --------------------------
@@ -253,8 +253,9 @@ class SofiBotManager:
         self.ka_thread = None
         self.watchdog_thread = None
         self.claim_timeout_thread = None
-        self.sent_initial_sd = False
+
         self.bot_identity_logged = False
+        self.sent_initial_sd = False  # ensure first sd fires after on_ready
 
         # config defaults
         load_dotenv(self.cfg_path)
@@ -264,6 +265,15 @@ class SofiBotManager:
         self.USER_ID = os.getenv("USER_ID", "")
         self.SD_INTERVAL_SEC = int(os.getenv("SD_INTERVAL_SEC", "480"))
         self.USE_GPU = (os.getenv("OCR_USE_GPU", "0") == "1")
+
+        # preferences
+        prefs_raw = os.getenv("PREFERENCES", "no_gen,low_gen,high_likes,series_match")
+        self.preferences = [p.strip().lower() for p in prefs_raw.split(",") if p.strip()]
+        valid_prefs = {"no_gen", "low_gen", "high_likes", "series_match"}
+        self.preferences = [p for p in self.preferences if p in valid_prefs]
+        if not self.preferences:
+            self.preferences = ["no_gen", "low_gen", "high_likes", "series_match"]
+        self.series_preference = os.getenv("SERIES_NAME", "").strip()
 
         # leaderboard
         self.TOP_CHARACTERS_LIST, self.TOP_CHARACTERS_SET = load_top_characters(self.leaderboard_path)
@@ -285,13 +295,12 @@ class SofiBotManager:
                 self.pending_claim["triggered"] = False
 
     def periodic_sd_sender(self):
-        """Wait until initial 'sd' is sent (in on_ready), then send every 8 minutes."""
-        # wait until on_ready sends the first 'sd' or we stop
+        """Wait until initial 'sd' is sent (in on_ready), then send every ~8 minutes."""
         while not self.stop_event.is_set() and not self.sent_initial_sd:
             time.sleep(0.2)
 
         while not self.stop_event.is_set():
-            wait_time = 480 + random.uniform(0, 10)  # ~8min + jitter
+            wait_time = float(self.SD_INTERVAL_SEC) + random.uniform(0, 10)
             logging.info(f"⏳ Waiting {wait_time:.1f}s before sending next 'sd'…")
             self.stop_event.wait(wait_time)
             if self.stop_event.is_set():
@@ -304,7 +313,6 @@ class SofiBotManager:
                 logging.info("📤 Sent 'sd' command.")
             except Exception:
                 logging.exception("⚠️ Failed to send 'sd'")
-
 
     def keep_alive(self):
         previous_latency = None
@@ -352,69 +360,119 @@ class SofiBotManager:
             return
 
         card_info = extract_card_generations(pil_image)
-        claimed_indexes = []
 
-        # first pass: claim any no-generation card quickly
+        # ----- Build per-card metadata once -----
+        cards = []
         for i in range(card_count):
-            generations = card_info.get(i, {}).get("generations", {})
-            if not generations:
-                self.click_discord_button(button_ids[i], channel_id, guild_id, m)
-                card_claimed_time = time.time()
-                elapsed_time = card_claimed_time - image_received_time
-                time.sleep(3)
-                logging.info(f"Claimed card {i+1} (no generation) in {elapsed_time:.2f}s")
-                claimed_indexes.append(i)
+            info = card_info.get(i, {})
+            gens = info.get("generations", {}) or {}
+            name = info.get("name") or ""
+            series = info.get("series") or ""
 
-        # choose best among remaining
-        best_match_index = None
-        best_score = -1
-        best_likes = -1
-        best_match_name = None
-        best_match_series = None
-        lowest_gen_index = None
-        lowest_gen_value = float("inf")
-        gen_below_10_index = None
+            match_score, match_idx, likes, matched_name, matched_series = find_best_character_match(
+                name, series, self.TOP_CHARACTERS_LIST
+            )
 
-        for i in range(card_count):
-            if i in claimed_indexes or i not in card_info:
-                continue
-            info = card_info[i]
-            name = info.get("name")
-            series = info.get("series")
-            generations = info.get("generations", {})
+            cards.append({
+                "index": i,
+                "gens": gens,
+                "has_gen": bool(gens),
+                "min_gen": min(gens.values()) if gens else None,
+                "name": name,
+                "series": series,
+                "match_score": match_score if match_score is not None else 0,
+                "likes": likes or 0,
+                "matched_series": (matched_series or "")
+            })
+        # 🚨 Absolute rule: if any card has generation < 10, choose it now (ignore preferences)
+        low_gen_candidates = [c for c in cards if c["min_gen"] is not None and c["min_gen"] < 10]
+        if low_gen_candidates:
+            # tie-breakers within low-gen: lowest generation first, then highest likes, then lowest index
+            low_gen_candidates.sort(key=lambda c: (c["min_gen"], -c["likes"], c["index"]))
+            chosen = low_gen_candidates[0]
+            chosen_index = chosen["index"]
 
-            if name and series:
-                match = find_best_character_match(name, series, self.TOP_CHARACTERS_LIST)
-                if match:
-                    score, _, likes, matched_name, matched_series = match
-                    if score is not None and score >= 60:
-                        if score > best_score or (score == best_score and likes > best_likes):
-                            best_score = score
-                            best_likes = likes
-                            best_match_index = i
-                            best_match_name = matched_name
-                            best_match_series = matched_series
+            # cooldown/pending gating (kept as-is)
+            now = time.time()
+            if chosen.get("gens", {}):
+                with self.last_processed_time_lock:
+                    cooldown_active = self.last_processed_time and (now - self.last_processed_time < self.PROCESS_COOLDOWN_SECONDS)
+                    pending_active = self.pending_claim.get("triggered", False)
+                    if pending_active or cooldown_active:
+                        if pending_active:
+                            logging.info("Skipping claim — waiting previous claim confirmation.")
+                        elif cooldown_active:
+                            logging.info("Skipping claim — cooldown not expired.")
+                        return
 
-            if generations:
-                gen_value = min(generations.values())
-                if gen_value < 10 and gen_below_10_index is None:
-                    gen_below_10_index = i
-                if gen_value < lowest_gen_value:
-                    lowest_gen_value = gen_value
-                    lowest_gen_index = i
+            # Click immediately
+            self.click_discord_button(button_ids[chosen_index], channel_id, guild_id, m)
+            self.pending_claim["timestamp"] = now
+            self.pending_claim["triggered"] = True
+            self.pending_claim["user_id"] = self.USER_ID
 
-        chosen_index = (
-            gen_below_10_index
-            if gen_below_10_index is not None
-            else best_match_index
-            if best_match_index is not None
-            else lowest_gen_index
-            if lowest_gen_index is not None
-            else next((i for i in range(card_count) if i not in claimed_indexes), None)
-        )
+            elapsed_time = time.time() - image_received_time
+            logging.info(f"✅ Claimed card {chosen_index+1} (⚡ generation < 10: G{chosen['min_gen']} ⚡) in {elapsed_time:.2f}s")
+            return    
 
+        def filter_by_pref(candidates, pref):
+            if pref == "no_gen":
+                kept = [c for c in candidates if not c["has_gen"]]
+                return kept if kept else candidates
+
+            if pref == "low_gen":
+                with_gen = [c for c in candidates if c["min_gen"] is not None]
+                if not with_gen:
+                    return candidates
+                minval = min(c["min_gen"] for c in with_gen)
+                kept = [c for c in with_gen if c["min_gen"] == minval]
+                return kept
+
+            if pref == "high_likes":
+                with_likes = [c for c in candidates if c["likes"] > 0]
+                if not with_likes:
+                    return candidates
+                maxlikes = max(c["likes"] for c in with_likes)
+                kept = [c for c in with_likes if c["likes"] == maxlikes]
+                return kept
+
+            if pref == "series_match":
+                key = (self.series_preference or "").strip().lower()
+                if not key:
+                    return candidates
+                matched = [
+                    c for c in candidates
+                    if key in (c["matched_series"] or "").lower()
+                    or key in (c["series"] or "").lower()
+                ]
+                return matched if matched else candidates
+
+            return candidates
+
+        # ----- Apply preferences in order -----
+        candidates = cards[:]
+        for pref in self.preferences:
+            before = candidates
+            candidates = filter_by_pref(candidates, pref)
+            if not candidates:
+                candidates = before  # don't eliminate all
+
+        # ----- Final tie-breakers -----
+        def sort_key(c):
+            gen = c["min_gen"] if c["min_gen"] is not None else 10**9  # None sorts after numbers
+            return (gen, -c["likes"])
+
+        candidates.sort(key=sort_key)
+        chosen = candidates[0] if candidates else None
+        if not chosen:
+            logging.warning("No card chosen to claim.")
+            return
+
+        chosen_index = chosen["index"]
+
+        # cooldown / pending gating only if we have generation info
         now = time.time()
-        generations = card_info.get(chosen_index, {}).get("generations", {})
+        generations = chosen.get("gens", {})
 
         if generations:
             with self.last_processed_time_lock:
@@ -427,22 +485,29 @@ class SofiBotManager:
                         logging.info("Skipping claim — cooldown not expired.")
                     return
 
-        if chosen_index is not None:
-            self.click_discord_button(button_ids[chosen_index], channel_id, guild_id, m)
-            self.pending_claim["timestamp"] = now
-            self.pending_claim["triggered"] = True
-            self.pending_claim["user_id"] = self.USER_ID
-            card_claimed_time = time.time()
-            elapsed_time = card_claimed_time - image_received_time
+        # Click
+        self.click_discord_button(button_ids[chosen_index], channel_id, guild_id, m)
+        self.pending_claim["timestamp"] = now
+        self.pending_claim["triggered"] = True
+        self.pending_claim["user_id"] = self.USER_ID
 
-            if best_match_index == chosen_index:
-                logging.info(f"Claimed card {chosen_index+1} (best match) in {elapsed_time:.2f}s")
-            elif gen_below_10_index == chosen_index:
-                logging.info(f"Claimed card {chosen_index+1} (generation < 10) in {elapsed_time:.2f}s")
-            else:
-                logging.info(f"Claimed card {chosen_index+1} (lowest generation) in {elapsed_time:.2f}s")
-        else:
-            logging.warning("No card chosen to claim.")
+        card_claimed_time = time.time()
+        elapsed_time = card_claimed_time - image_received_time
+
+        tag = ""
+        if not chosen["has_gen"]:
+            tag = "no generation"
+        elif chosen["min_gen"] is not None and chosen["min_gen"] < 10:
+            tag = f"gen {chosen['min_gen']}"
+        elif chosen["likes"] > 0:
+            tag = f"likes {chosen['likes']}"
+        if self.series_preference and (
+            self.series_preference.lower() in (chosen["matched_series"] or "").lower()
+            or self.series_preference.lower() in (chosen["series"] or "").lower()
+        ):
+            tag = f"{tag} / series match".strip(" /")
+
+        logging.info(f"✅ Claimed card {chosen_index+1} ({tag or 'preference match'}) in {elapsed_time:.2f}s")
 
     # --------- Bot lifecycle ---------
     def _install_handlers(self):
@@ -458,18 +523,18 @@ class SofiBotManager:
 
             # 🔥 Initial 'sd' right after gateway is ready (only once)
             if not self.sent_initial_sd:
-                for attempt in range(1, 6):  # small retry loop in case session_id races
+                for attempt in range(1, 6):
                     try:
                         if self.bot and self.bot.gateway.session_id:
                             self.bot.sendMessage(self.CHANNEL_ID, "sd")
                             self.sent_initial_sd = True
-                            logging.info("📤 Sent initial 'sd' command right after on_ready.")
+                            logging.info("📤 Sent 'sd' command.")
                             break
                         else:
                             logging.debug("Gateway ready but session_id not set yet; retrying…")
                     except Exception:
                         logging.exception("⚠️ Failed to send initial 'sd'")
-                    time.sleep(0.5)  # brief retry delay
+                    time.sleep(0.5)
 
         @self.bot.gateway.command
         def on_message(resp):
@@ -513,10 +578,6 @@ class SofiBotManager:
             if not attachments or not components:
                 return
 
-            with self.last_drop_id_lock:
-                # update last drop id (not displayed, but kept for parity)
-                pass
-
             def process_sofi_drop(attachment_url, components, channel_id, guild_id, m):
                 try:
                     response = requests.get(attachment_url, timeout=15)
@@ -546,7 +607,7 @@ class SofiBotManager:
         # Init OCR (download on first run). Default: CPU (packaging-friendly)
         logging.info(f"Initializing EasyOCR (gpu={self.USE_GPU}) …")
         READER = easyocr.Reader(["en"], gpu=self.USE_GPU, verbose=False)
-        # warm-up: speeds up first pass, and downloads model if needed
+        # warm-up
         _ = READER.readtext(np.zeros((100, 100, 3), dtype=np.uint8), detail=0)
 
         # Init Discum
@@ -556,6 +617,7 @@ class SofiBotManager:
         self.stop_event.clear()
         self.pending_claim["user_id"] = self.USER_ID
         self.bot_identity_logged = False
+        self.sent_initial_sd = False
 
         # helper threads
         self.sd_thread = threading.Thread(target=self.periodic_sd_sender, daemon=True)
@@ -591,7 +653,6 @@ class SofiBotManager:
         logging.info("Bot stopped.")
 
     def restart_process(self):
-        # Graceful stop and re-exec current program with same args
         self.stop()
         time.sleep(1)
         os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -604,6 +665,8 @@ class SofiBotManager:
             "USER_ID": self.USER_ID,
             "SD_INTERVAL_SEC": str(self.SD_INTERVAL_SEC),
             "OCR_USE_GPU": "1" if self.USE_GPU else "0",
+            "PREFERENCES": ",".join(self.preferences),
+            "SERIES_NAME": self.series_preference,
         }
         with open(self.cfg_path, "w", encoding="utf-8") as f:
             for k, v in data.items():
@@ -614,21 +677,36 @@ class SofiBotManager:
 # Tkinter UI
 # --------------------------
 class TextHandler(logging.Handler):
-    """Route logs to Tkinter safely."""
+    """Send logs to Tkinter with per-level colors using text tags."""
     def __init__(self, widget: ScrolledText):
         super().__init__()
         self.widget = widget
+        self.formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
     def emit(self, record):
         msg = self.format(record) + "\n"
+        level = record.levelno
+        # choose tag by level
+        if level >= logging.CRITICAL:
+            tag = "CRITICAL"
+        elif level >= logging.ERROR:
+            tag = "ERROR"
+        elif level >= logging.WARNING:
+            tag = "WARNING"
+        elif level >= logging.INFO:
+            tag = "INFO"
+        else:
+            tag = "DEBUG"
+
+        # UI updates must be scheduled on the main thread
         try:
-            self.widget.after(0, self._append, msg)
+            self.widget.after(0, self._append_with_tag, msg, tag)
         except Exception:
             pass
 
-    def _append(self, msg):
+    def _append_with_tag(self, msg, tag):
         self.widget.configure(state="normal")
-        self.widget.insert(tk.END, msg)
+        self.widget.insert(tk.END, msg, tag)
         self.widget.see(tk.END)
         self.widget.configure(state="disabled")
 
@@ -636,8 +714,8 @@ class SofiApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Sofi Farming Bot (Discum + OCR)")
-        self.geometry("980x650")
-        self.minsize(900, 600)
+        self.geometry("980x760")
+        self.minsize(900, 650)
 
         # Bot manager
         self.manager = SofiBotManager()
@@ -648,12 +726,11 @@ class SofiApp(tk.Tk):
 
         # preload fields
         self._load_fields_from_manager()
-        self._start()
 
         # OS signals to close cleanly if run as script
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
-
+        self._start()
         self._tick_status()
 
     def _build_ui(self):
@@ -693,6 +770,45 @@ class SofiApp(tk.Tk):
         self.var_gpu = tk.BooleanVar(value=False)
         ttk.Checkbutton(frm_top, text="Use GPU for OCR (advanced)", variable=self.var_gpu).grid(row=3, column=1, sticky="w", pady=(2, 8))
 
+        # ----- Preferences -----
+        frm_prefs = ttk.LabelFrame(self, text="Claim preferences (priority order)")
+        frm_prefs.pack(fill="x", padx=8, pady=6)
+
+        choices = ["no_gen", "low_gen", "high_likes", "series_match"]
+
+        ttk.Label(frm_prefs, text="Priority 1").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        ttk.Label(frm_prefs, text="Priority 2").grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(frm_prefs, text="Priority 3").grid(row=0, column=2, sticky="w", padx=6, pady=4)
+        ttk.Label(frm_prefs, text="Priority 4").grid(row=0, column=3, sticky="w", padx=6, pady=4)
+
+        self.var_pref1 = tk.StringVar(value="no_gen")
+        self.var_pref2 = tk.StringVar(value="low_gen")
+        self.var_pref3 = tk.StringVar(value="high_likes")
+        self.var_pref4 = tk.StringVar(value="series_match")
+
+        self.cmb_pref1 = ttk.Combobox(frm_prefs, values=choices, textvariable=self.var_pref1, state="readonly", width=16)
+        self.cmb_pref2 = ttk.Combobox(frm_prefs, values=choices, textvariable=self.var_pref2, state="readonly", width=16)
+        self.cmb_pref3 = ttk.Combobox(frm_prefs, values=choices, textvariable=self.var_pref3, state="readonly", width=16)
+        self.cmb_pref4 = ttk.Combobox(frm_prefs, values=choices, textvariable=self.var_pref4, state="readonly", width=16)
+        self.cmb_pref1.grid(row=1, column=0, padx=6, pady=4, sticky="w")
+        self.cmb_pref2.grid(row=1, column=1, padx=6, pady=4, sticky="w")
+        self.cmb_pref3.grid(row=1, column=2, padx=6, pady=4, sticky="w")
+        self.cmb_pref4.grid(row=1, column=3, padx=6, pady=4, sticky="w")
+
+        ttk.Label(frm_prefs, text="Series name (for 'series_match')").grid(row=2, column=0, sticky="w", padx=6, pady=(6, 4))
+        self.var_series = tk.StringVar(value="")
+        self.ent_series = ttk.Entry(frm_prefs, textvariable=self.var_series, width=40)
+        self.ent_series.grid(row=2, column=1, columnspan=3, sticky="w", padx=6, pady=(6, 4))
+
+        def _toggle_series_state(*_):
+            prefs = [self.var_pref1.get(), self.var_pref2.get(), self.var_pref3.get(), self.var_pref4.get()]
+            enable = "series_match" in prefs
+            self.ent_series.configure(state=("normal" if enable else "disabled"))
+
+        for cmb in (self.cmb_pref1, self.cmb_pref2, self.cmb_pref3, self.cmb_pref4):
+            cmb.bind("<<ComboboxSelected>>", _toggle_series_state)
+        _toggle_series_state()
+
         # Buttons
         frm_btns = ttk.Frame(self)
         frm_btns.pack(fill="x", **pad)
@@ -717,6 +833,13 @@ class SofiApp(tk.Tk):
         frm_log.pack(fill="both", expand=True, **pad)
         self.txt_log = ScrolledText(frm_log, height=24, state="disabled")
         self.txt_log.pack(fill="both", expand=True, padx=6, pady=6)
+
+        self.txt_log.tag_config("DEBUG",    foreground="#6b7280")  # slate-500
+        self.txt_log.tag_config("INFO",     foreground="#2563eb")  # blue-600
+        self.txt_log.tag_config("WARNING",  foreground="#d97706")  # amber-600
+        self.txt_log.tag_config("ERROR",    foreground="#dc2626")  # red-600
+        self.txt_log.tag_config("CRITICAL", foreground="#ffffff", background="#b91c1c")  # white on red
+        self.txt_log.tag_config("CRITICAL", font=("TkDefaultFont", 9, "bold"))
 
         # Footer
         frm_footer = ttk.Frame(self)
@@ -745,6 +868,14 @@ class SofiApp(tk.Tk):
         self.var_interval.set(m.SD_INTERVAL_SEC)
         self.var_gpu.set(bool(m.USE_GPU))
 
+        # preferences
+        prefs = (m.preferences + ["", "", "", ""])[:4]
+        self.var_pref1.set(prefs[0] or "no_gen")
+        self.var_pref2.set(prefs[1] or "low_gen")
+        self.var_pref3.set(prefs[2] or "high_likes")
+        self.var_pref4.set(prefs[3] or "series_match")
+        self.var_series.set(m.series_preference or "")
+
     def _toggle_token(self):
         self.ent_token.configure(show="" if self.show_token.get() else "•")
 
@@ -757,6 +888,17 @@ class SofiApp(tk.Tk):
         m.USER_ID = self.var_user.get().strip()
         m.SD_INTERVAL_SEC = int(self.var_interval.get())
         m.USE_GPU = bool(self.var_gpu.get())
+
+        # preferences from UI, keep order & unique
+        prefs = [self.var_pref1.get(), self.var_pref2.get(), self.var_pref3.get(), self.var_pref4.get()]
+        seen = set()
+        m.preferences = []
+        for p in prefs:
+            p = p.strip().lower()
+            if p and p not in seen:
+                m.preferences.append(p)
+                seen.add(p)
+        m.series_preference = self.var_series.get().strip()
 
         if not m.TOKEN or not m.CHANNEL_ID or not m.USER_ID:
             messagebox.showerror("Missing", "Please fill Token, Channel ID, and User ID.")
@@ -790,6 +932,18 @@ class SofiApp(tk.Tk):
         m.USER_ID = self.var_user.get().strip()
         m.SD_INTERVAL_SEC = int(self.var_interval.get())
         m.USE_GPU = bool(self.var_gpu.get())
+
+        # preferences from UI
+        prefs = [self.var_pref1.get(), self.var_pref2.get(), self.var_pref3.get(), self.var_pref4.get()]
+        seen = set()
+        m.preferences = []
+        for p in prefs:
+            p = p.strip().lower()
+            if p and p not in seen:
+                m.preferences.append(p)
+                seen.add(p)
+        m.series_preference = self.var_series.get().strip()
+
         try:
             m.save_env()
             messagebox.showinfo("Saved", f"Settings saved to {m.cfg_path}")
@@ -815,5 +969,22 @@ class SofiApp(tk.Tk):
         self.after(1000, self._tick_status)
 
 if __name__ == "__main__":
-    app = SofiApp()
-    app.mainloop()
+    import argparse, time
+    p = argparse.ArgumentParser()
+    p.add_argument("--headless", action="store_true", help="Run without Tkinter UI")
+    args = p.parse_args()
+
+    if args.headless:
+        # load .env the same way your GUI does (your load_env_multi/ensure_default_env if added)
+        mgr = SofiBotManager()
+        try:
+            mgr.start()
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            mgr.stop()
+    else:
+        app = SofiApp()
+        app.mainloop()

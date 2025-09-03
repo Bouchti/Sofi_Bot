@@ -1,3 +1,6 @@
 .qodo
 .env
 Sofi_bot.log
+.venv
+build
+dist
