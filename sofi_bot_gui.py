@@ -91,7 +91,6 @@ def preprocess_image(image):
     if len(image.shape) == 3:
         image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     return image
-
 def extract_generation_with_easyocr(image):
     """Return (generations_dict, name, series)."""
     global READER
@@ -160,31 +159,167 @@ def extract_generation_with_easyocr(image):
     generations = clean_generation_text(extracted_text)
     name, series = extract_card_name_and_series(extracted_text)
     return generations, name, series
+def _circular_hue_std(hue_deg: np.ndarray) -> float:
+    if hue_deg.size == 0:
+        return 0.0
+    theta = np.deg2rad(hue_deg)
+    C, S = np.mean(np.cos(theta)), np.mean(np.sin(theta))
+    R = np.sqrt(C*C + S*S)
+    if R <= 1e-6:
+        return 180.0
+    return np.rad2deg(np.sqrt(-2.0*np.log(R)))
 
+
+def is_elite_card(card_img_bgr: np.ndarray,
+                  ring_ratio: float = 0.06,
+                  sat_min: int = 60,
+                  val_min: int = 60,
+                  bins_required: int = 9,
+                  frac_outside_gold_min: float = 0.40,
+                  circ_std_min: float = 60.0,
+                  gold_low_deg: float = 35.0,
+                  gold_high_deg: float = 65.0):
+    """
+    Robust elite detector: checks hue diversity, fraction outside gold,
+    and circular hue spread. Matches standalone test.
+    """
+    h, w = card_img_bgr.shape[:2]
+    if h < 40 or w < 40:
+        return False, {"reason": "too_small"}
+
+    bw = max(2, int(w * ring_ratio))
+    bh = max(2, int(h * ring_ratio))
+    mask = np.zeros((h, w), dtype=np.uint8)
+    mask[:bh, :] = 1
+    mask[h-bh:, :] = 1
+    mask[:, :bw] = 1
+    mask[:, w-bw:] = 1
+
+    hsv = cv2.cvtColor(card_img_bgr, cv2.COLOR_BGR2HSV)
+    Hdeg = hsv[:, :, 0].astype(np.float32) * 2.0
+    S, V = hsv[:, :, 1], hsv[:, :, 2]
+
+    border_mask = (mask == 1) & (S >= sat_min) & (V >= val_min)
+    if not np.any(border_mask):
+        return False, {"reason": "no_vivid_border"}
+
+    hue_deg = Hdeg[border_mask]
+    hist, _ = np.histogram(hue_deg, bins=18, range=(0, 360))
+    nonzero_bins = int((hist > 0).sum())
+    frac_outside_gold = float(np.mean((hue_deg < gold_low_deg) | (hue_deg > gold_high_deg)))
+    circ_std = _circular_hue_std(hue_deg)
+    # dominant-hue guard: if one bin has most pixels, it's not rainbow
+    dominant_peak_frac = hist.max() / max(1, hist.sum())
+
+    elite = (
+        (nonzero_bins >= bins_required) and
+        (frac_outside_gold >= frac_outside_gold_min) and
+        (circ_std >= circ_std_min) and
+        (dominant_peak_frac <= 0.70)    # reject single-color borders
+    )
+
+    metrics = {
+        "nonzero_bins": nonzero_bins,
+        "frac_outside_gold": round(frac_outside_gold, 3),
+        "circ_std_deg": round(circ_std, 1),
+        "kept_pixels": int(hue_deg.size),
+    }
+    return elite, metrics
 def extract_card_for_index(index, card_crop):
     try:
+        # Convert to ndarray
+        if isinstance(card_crop, Image.Image):
+            rgb = np.array(card_crop)
+        else:
+            rgb = card_crop
+
+        if rgb.ndim == 3 and rgb.shape[2] == 3:
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        else:
+            bgr = rgb
+
+        # Elite detection
+        elite, emetrics = is_elite_card(bgr)
+        if elite:
+            logging.info(f"🌈 Elite detected on card {index+1} → {emetrics}")
+
+        # OCR pipeline
         processed = preprocess_image(card_crop)
         gens, name, series = extract_generation_with_easyocr(processed)
-        return index, (gens, name, series)
-    except Exception as e:
-        logging.warning(f"Failed to process card index {index}: {e}")
-        return index, ({}, "", "")
 
-def extract_card_generations(image):
+        return index, (gens, name, series, elite)
+
+    except Exception as e:
+        logging.warning(f"⚠️ Failed to process card index {index}: {e}")
+        return index, ({}, "", "", False)
+
+def extract_card_generations(image: Image.Image):
+    """
+    Splits the 3-card image, OCRs each card in parallel, and returns:
+      { index: {
+          'generations': dict,
+          'name': str,
+          'series': str,
+          'elite': bool
+        }, ... }
+    """
     card_width = image.width // 3
     card_info = {}
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = []
-        for i in range(3):
-            left = i * card_width
-            right = left + card_width
-            crop = image.crop((left, 0, right, image.height))
-            futures.append(executor.submit(extract_card_for_index, i, crop))
-        for future in futures:
-            i, (gens, name, series) = future.result()
-            if gens or name:
-                card_info[i] = {"generations": gens or {}, "name": name or "", "series": series or ""}
+
+    def _crop_card(i: int) -> Image.Image:
+        left = i * card_width
+        right = left + card_width if i < 2 else image.width  # last card gets any remainder
+        return image.crop((left, 0, right, image.height))
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(extract_card_for_index, i, _crop_card(i)) for i in range(3)]
+
+        for fut in futures:
+            try:
+                i, (gens, name, series, elite) = fut.result()
+
+                # record if we have any useful signal at all
+                if gens or name or elite:
+                    card_info[i] = {
+                        "generations": gens or {},
+                        "name": name or "",
+                        "series": series or "",
+                        "elite": bool(elite),
+                    }
+                else:
+                    # ensure the key exists with defaults (optional)
+                    card_info[i] = {
+                        "generations": {},
+                        "name": "",
+                        "series": "",
+                        "elite": False,
+                    }
+
+                logging.info(
+                    f"✅ Card {i}: Gen={list((gens or {}).keys()) or '∅'}, "
+                    f"Name='{name or ''}', Series='{series or ''}', Elite={elite}"
+                )
+
+            except Exception as e:
+                logging.warning(f"⚠️ Failed to extract data for card: {e}")
+                # keep a default entry to avoid KeyError downstream
+                i_fallback = 0
+                try:
+                    i_fallback = fut.result()[0]
+                except Exception:
+                    pass
+                card_info[i_fallback] = {
+                    "generations": {},
+                    "name": "",
+                    "series": "",
+                    "elite": False,
+                }
+
+    logging.debug(f"🚀 FINAL CARD INFO: {card_info}")
     return card_info
+
 
 def find_best_character_match(name, series, TOP_CHARACTERS_LIST):
     if not name:
@@ -364,6 +499,10 @@ class SofiBotManager:
         # ----- Build per-card metadata once -----
         cards = []
         for i in range(card_count):
+            if card_info.get(i, {}).get("elite"):
+                self.click_discord_button(button_ids[i], channel_id, guild_id, m)
+                logging.info(f"✅ Claimed card {i+1} (🌈 ELITE 🌈)")
+                return
             info = card_info.get(i, {})
             gens = info.get("generations", {}) or {}
             name = info.get("name") or ""

@@ -4,3 +4,8 @@ Sofi_bot.log
 .venv
 build
 dist
+SofiBotGUI.spec
+elite_card_test.py
+elite_card.png
+elite_card2.png
+elite_card3.png
