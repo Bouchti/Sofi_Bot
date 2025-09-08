@@ -91,6 +91,7 @@ def preprocess_image(image):
     if len(image.shape) == 3:
         image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     return image
+
 def extract_generation_with_easyocr(image):
     """Return (generations_dict, name, series)."""
     global READER
@@ -112,7 +113,7 @@ def extract_generation_with_easyocr(image):
             if match_6g:
                 gen_number = f"G{match_6g.group(1)}"
                 cleaned_generations[gen_number] = int(match_6g.group(1))
-                continue
+                continue`
 
             text_clean = re.sub(r"[^a-zA-Z0-9]", "", original_text)
             # ONLY substitutions on gen-like strings
@@ -159,6 +160,7 @@ def extract_generation_with_easyocr(image):
     generations = clean_generation_text(extracted_text)
     name, series = extract_card_name_and_series(extracted_text)
     return generations, name, series
+
 def _circular_hue_std(hue_deg: np.ndarray) -> float:
     if hue_deg.size == 0:
         return 0.0
@@ -168,7 +170,6 @@ def _circular_hue_std(hue_deg: np.ndarray) -> float:
     if R <= 1e-6:
         return 180.0
     return np.rad2deg(np.sqrt(-2.0*np.log(R)))
-
 
 def is_elite_card(card_img_bgr: np.ndarray,
                   ring_ratio: float = 0.06,
@@ -225,6 +226,7 @@ def is_elite_card(card_img_bgr: np.ndarray,
         "kept_pixels": int(hue_deg.size),
     }
     return elite, metrics
+
 def extract_card_for_index(index, card_crop):
     try:
         # Convert to ndarray
@@ -271,8 +273,6 @@ def extract_card_generations(image: Image.Image):
         right = left + card_width if i < 2 else image.width  # last card gets any remainder
         return image.crop((left, 0, right, image.height))
 
-    from concurrent.futures import ThreadPoolExecutor
-
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = [executor.submit(extract_card_for_index, i, _crop_card(i)) for i in range(3)]
 
@@ -304,13 +304,8 @@ def extract_card_generations(image: Image.Image):
 
             except Exception as e:
                 logging.warning(f"⚠️ Failed to extract data for card: {e}")
-                # keep a default entry to avoid KeyError downstream
-                i_fallback = 0
-                try:
-                    i_fallback = fut.result()[0]
-                except Exception:
-                    pass
-                card_info[i_fallback] = {
+                # ensure safe default
+                card_info[len(card_info)] = {
                     "generations": {},
                     "name": "",
                     "series": "",
@@ -319,7 +314,6 @@ def extract_card_generations(image: Image.Image):
 
     logging.debug(f"🚀 FINAL CARD INFO: {card_info}")
     return card_info
-
 
 def find_best_character_match(name, series, TOP_CHARACTERS_LIST):
     if not name:
@@ -419,14 +413,15 @@ class SofiBotManager:
             time.sleep(10)
             elapsed = time.time() - self.last_message_received
             if elapsed > self.WATCHDOG_TIMEOUT:
-                logging.error(f"No message received for {elapsed:.1f}s. Restarting bot process...")
-                self.restart_process()
+                logging.error(f"🛑 No message received for {elapsed:.1f}s. Restarting bot (soft)…")
+                self.restart_bot()
+                return  # let new watchdog start in restart_bot
 
     def reset_claim_if_timed_out(self):
         while not self.stop_event.is_set():
             time.sleep(1)
             if self.pending_claim["triggered"] and time.time() - (self.pending_claim["timestamp"] or 0) > 7:
-                logging.warning("No Sofi confirmation received. Resetting claim trigger.")
+                logging.warning("⚠️ No Sofi confirmation received. Resetting claim trigger.")
                 self.pending_claim["triggered"] = False
 
     def periodic_sd_sender(self):
@@ -462,10 +457,11 @@ class SofiBotManager:
                     failure_count = 0
                 previous_latency = latency
                 if failure_count >= 3:
-                    logging.error("Gateway appears frozen. Restarting process...")
-                    self.restart_process()
+                    logging.error("🛑 Gateway appears frozen. Restarting bot (soft)…")
+                    self.restart_bot()
+                    return
             except Exception as e:
-                logging.error(f"keep_alive check failed: {e}")
+                logging.error(f"❌ keep_alive check failed: {e}")
 
     # --------- Bot actions ---------
     def click_discord_button(self, custom_id, channel_id, guild_id, m):
@@ -523,15 +519,14 @@ class SofiBotManager:
                 "likes": likes or 0,
                 "matched_series": (matched_series or "")
             })
+
         # 🚨 Absolute rule: if any card has generation < 10, choose it now (ignore preferences)
         low_gen_candidates = [c for c in cards if c["min_gen"] is not None and c["min_gen"] < 10]
         if low_gen_candidates:
-            # tie-breakers within low-gen: lowest generation first, then highest likes, then lowest index
             low_gen_candidates.sort(key=lambda c: (c["min_gen"], -c["likes"], c["index"]))
             chosen = low_gen_candidates[0]
             chosen_index = chosen["index"]
 
-            # cooldown/pending gating (kept as-is)
             now = time.time()
             if chosen.get("gens", {}):
                 with self.last_processed_time_lock:
@@ -544,7 +539,6 @@ class SofiBotManager:
                             logging.info("Skipping claim — cooldown not expired.")
                         return
 
-            # Click immediately
             self.click_discord_button(button_ids[chosen_index], channel_id, guild_id, m)
             self.pending_claim["timestamp"] = now
             self.pending_claim["triggered"] = True
@@ -552,7 +546,7 @@ class SofiBotManager:
 
             elapsed_time = time.time() - image_received_time
             logging.info(f"✅ Claimed card {chosen_index+1} (⚡ generation < 10: G{chosen['min_gen']} ⚡) in {elapsed_time:.2f}s")
-            return    
+            return
 
         def filter_by_pref(candidates, pref):
             if pref == "no_gen":
@@ -564,16 +558,14 @@ class SofiBotManager:
                 if not with_gen:
                     return candidates
                 minval = min(c["min_gen"] for c in with_gen)
-                kept = [c for c in with_gen if c["min_gen"] == minval]
-                return kept
+                return [c for c in with_gen if c["min_gen"] == minval]
 
             if pref == "high_likes":
                 with_likes = [c for c in candidates if c["likes"] > 0]
                 if not with_likes:
                     return candidates
                 maxlikes = max(c["likes"] for c in with_likes)
-                kept = [c for c in with_likes if c["likes"] == maxlikes]
-                return kept
+                return [c for c in with_likes if c["likes"] == maxlikes]
 
             if pref == "series_match":
                 key = (self.series_preference or "").strip().lower()
@@ -588,17 +580,15 @@ class SofiBotManager:
 
             return candidates
 
-        # ----- Apply preferences in order -----
         candidates = cards[:]
         for pref in self.preferences:
             before = candidates
             candidates = filter_by_pref(candidates, pref)
             if not candidates:
-                candidates = before  # don't eliminate all
+                candidates = before
 
-        # ----- Final tie-breakers -----
         def sort_key(c):
-            gen = c["min_gen"] if c["min_gen"] is not None else 10**9  # None sorts after numbers
+            gen = c["min_gen"] if c["min_gen"] is not None else 10**9
             return (gen, -c["likes"])
 
         candidates.sort(key=sort_key)
@@ -609,7 +599,6 @@ class SofiBotManager:
 
         chosen_index = chosen["index"]
 
-        # cooldown / pending gating only if we have generation info
         now = time.time()
         generations = chosen.get("gens", {})
 
@@ -624,7 +613,6 @@ class SofiBotManager:
                         logging.info("Skipping claim — cooldown not expired.")
                     return
 
-        # Click
         self.click_discord_button(button_ids[chosen_index], channel_id, guild_id, m)
         self.pending_claim["timestamp"] = now
         self.pending_claim["triggered"] = True
@@ -789,8 +777,61 @@ class SofiBotManager:
                 self.bot.gateway.close()
         except Exception:
             pass
+        # try to join helper threads quickly
+        for t in (self.sd_thread, self.ka_thread, self.watchdog_thread, self.claim_timeout_thread, self.bot_thread):
+            try:
+                if t and t.is_alive():
+                    t.join(timeout=2.0)
+            except Exception:
+                pass
         logging.info("Bot stopped.")
 
+    # ---- NEW: soft restart (no process restart) ----
+    def restart_bot(self):
+        logging.info("🔄 Soft-restarting bot …")
+        try:
+            self.stop()
+        except Exception:
+            pass
+
+        # reset flags/state but keep OCR reader
+        self.stop_event = threading.Event()
+        self.pending_claim["triggered"] = False
+        self.sent_initial_sd = False
+        self.bot_identity_logged = False
+        self.last_message_received = time.time()
+
+        # recreate Discum client and handlers
+        try:
+            self.bot = discum.Client(token=self.TOKEN, log=False)
+            self._install_handlers()
+        except Exception as e:
+            logging.error(f"Failed to re-create Discum client: {e}")
+            return
+
+        # restart helper threads
+        self.sd_thread = threading.Thread(target=self.periodic_sd_sender, daemon=True)
+        self.ka_thread = threading.Thread(target=self.keep_alive, daemon=True)
+        self.watchdog_thread = threading.Thread(target=self.message_watchdog, daemon=True)
+        self.claim_timeout_thread = threading.Thread(target=self.reset_claim_if_timed_out, daemon=True)
+
+        self.sd_thread.start()
+        self.ka_thread.start()
+        self.watchdog_thread.start()
+        self.claim_timeout_thread.start()
+
+        # restart gateway
+        def run_gateway():
+            logging.info("Reconnecting to Discord gateway …")
+            try:
+                self.bot.gateway.run(auto_reconnect=True)
+            except Exception as e:
+                logging.critical(f"Failed to reconnect to Discord gateway: {e}")
+
+        self.bot_thread = threading.Thread(target=run_gateway, daemon=True)
+        self.bot_thread.start()
+
+    # (kept for reference; not used anymore)
     def restart_process(self):
         self.stop()
         time.sleep(1)
@@ -1114,7 +1155,6 @@ if __name__ == "__main__":
     args = p.parse_args()
 
     if args.headless:
-        # load .env the same way your GUI does (your load_env_multi/ensure_default_env if added)
         mgr = SofiBotManager()
         try:
             mgr.start()
