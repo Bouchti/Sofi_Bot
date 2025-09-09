@@ -113,7 +113,7 @@ def extract_generation_with_easyocr(image):
             if match_6g:
                 gen_number = f"G{match_6g.group(1)}"
                 cleaned_generations[gen_number] = int(match_6g.group(1))
-                continue`
+                continue
 
             text_clean = re.sub(r"[^a-zA-Z0-9]", "", original_text)
             # ONLY substitutions on gen-like strings
@@ -161,69 +161,232 @@ def extract_generation_with_easyocr(image):
     name, series = extract_card_name_and_series(extracted_text)
     return generations, name, series
 
-def _circular_hue_std(hue_deg: np.ndarray) -> float:
-    if hue_deg.size == 0:
-        return 0.0
-    theta = np.deg2rad(hue_deg)
-    C, S = np.mean(np.cos(theta)), np.mean(np.sin(theta))
-    R = np.sqrt(C*C + S*S)
-    if R <= 1e-6:
-        return 180.0
-    return np.rad2deg(np.sqrt(-2.0*np.log(R)))
+# --- Elite detector: rainbow frame only ---------------------------------------
+# Uses along-edge centerline sampling to verify a continuous hue sweep.
+# Returns (elite_bool, metrics_dict)  — signature preserved for callers.
 
-def is_elite_card(card_img_bgr: np.ndarray,
-                  ring_ratio: float = 0.06,
-                  sat_min: int = 60,
-                  val_min: int = 60,
-                  bins_required: int = 9,
-                  frac_outside_gold_min: float = 0.40,
-                  circ_std_min: float = 60.0,
-                  gold_low_deg: float = 35.0,
-                  gold_high_deg: float = 65.0):
+def _minimal_circular_range_deg(h_arr: np.ndarray) -> float:
+    if h_arr.size == 0:
+        return 0.0
+    d = np.sort(h_arr.astype(np.float32) * 2.0)  # OpenCV hue→degrees (0..360)
+    gaps = np.diff(np.r_[d, d[0] + 360.0])
+    largest_gap = float(np.max(gaps)) if gaps.size else 0.0
+    return 360.0 - largest_gap
+
+def _circular_std_deg(h_arr: np.ndarray) -> float:
+    if h_arr.size == 0:
+        return 0.0
+    ang = (h_arr.astype(np.float32) * 2.0) * (np.pi / 180.0)
+    s = np.sin(ang).sum()
+    c = np.cos(ang).sum()
+    n = float(h_arr.size)
+    R = np.sqrt(s*s + c*c) / max(n, 1.0)
+    R = float(np.clip(R, 1e-6, 0.999999))
+    return float(np.sqrt(-2.0 * np.log(R)) * (180.0 / np.pi))
+
+def _unwrap_degrees(seq_deg: np.ndarray) -> np.ndarray:
+    if seq_deg.size == 0:
+        return seq_deg.astype(np.float32)
+    s = seq_deg.astype(np.float32) * 2.0
+    out = [s[0]]
+    for v in s[1:]:
+        base = out[-1]
+        cand = np.array([v-360.0, v, v+360.0], dtype=np.float32)
+        out.append(cand[np.argmin(np.abs(cand - base))])
+    return np.array(out, dtype=np.float32)
+
+def _line_hist_metrics(h_arr: np.ndarray, hue_bins: int, bin_min_frac: float):
+    if h_arr.size == 0:
+        return dict(nonzero_bins=0, coverage=0.0, peak_frac=1.0, sector_count=0)
+    hist, _ = np.histogram(h_arr, bins=hue_bins, range=(0, 180))
+    total = float(hist.sum())
+    peak_frac = float(hist.max() / total) if total > 0 else 1.0
+    bin_frac = hist / max(total, 1.0)
+    active = (bin_frac > bin_min_frac)
+    nonzero_bins = int(active.sum())
+    coverage = nonzero_bins / float(hue_bins)
+    extended = np.r_[active, active[0]]
+    sector_count = int(np.sum(extended[1:] & ~extended[:-1]))
+    return dict(nonzero_bins=nonzero_bins, coverage=coverage,
+                peak_frac=peak_frac, sector_count=sector_count)
+
+def _centerline(edge, H, W, t, m):
+    if edge == 'top':
+        y = int(np.clip(m + t // 2, 0, H - 1)); xs = np.arange(W); ys = np.full_like(xs, y)
+    elif edge == 'bottom':
+        y = int(np.clip(H - m - t // 2 - 1, 0, H - 1)); xs = np.arange(W); ys = np.full_like(xs, y)
+    elif edge == 'left':
+        x = int(np.clip(m + t // 2, 0, W - 1)); ys = np.arange(H); xs = np.full_like(ys, x)
+    else:  # right
+        x = int(np.clip(W - m - t // 2 - 1, 0, W - 1)); ys = np.arange(H); xs = np.full_like(ys, x)
+    return xs, ys
+
+def _parallel_offsets(t, num_lines):
+    if num_lines <= 1:
+        return [0]
+    offs = np.linspace(-max(1, t // 4), max(1, t // 4), num_lines).astype(int)
+    return list(np.unique(offs))
+
+def _sample_line_hues(hsv, xs, ys, edge, off, sat_min, val_min):
+    H, W = hsv.shape[:2]
+    if edge in ('top', 'bottom'):
+        y = np.clip(ys + off, 0, H - 1)
+        h = hsv[y, xs, 0]; s = hsv[y, xs, 1]; v = hsv[y, xs, 2]
+    else:
+        x = np.clip(xs + off, 0, W - 1)
+        h = hsv[ys, x, 0]; s = hsv[ys, x, 1]; v = hsv[ys, x, 2]
+    mask = (s >= sat_min) & (v >= val_min)
+    return h[mask].astype(np.float32)
+
+def is_elite_card(
+    card_img_bgr: np.ndarray,
+    # geometry
+    ring_ratio: float = 0.06,
+    edge_margin: float = 0.03,
+    # vivid gate
+    sat_min: int = 60,
+    val_min: int = 75,
+    # hue hist
+    hue_bins: int = 36,
+    bin_min_frac: float = 0.02,
+    # along-edge rainbow gates
+    line_range_min_deg: float = 180.0,
+    line_coverage_req: float = 0.10,   # tuned to catch thin rainbows
+    line_sector_req: int = 2,
+    line_peak_max: float = 0.55,
+    line_count_min: int = 120,
+    # smoothness + across-thickness consistency
+    smooth_tv_over_range_max: float = 5.0,
+    big_jump_deg: float = 45.0,
+    big_jump_max_frac: float = 0.20,
+    across_lines: int = 5,
+    across_std_max_deg: float = 15.0,
+    # card aggregation
+    min_rainbow_edges: int = 2,
+    require_horiz_vert: bool = True,
+):
     """
-    Robust elite detector: checks hue diversity, fraction outside gold,
-    and circular hue spread. Matches standalone test.
+    Return (elite_bool, metrics_dict).
+    Elite == card frame shows a rainbow gradient on at least two edges
+    (and at least one horizontal + one vertical if require_horiz_vert=True).
     """
-    h, w = card_img_bgr.shape[:2]
-    if h < 40 or w < 40:
+    bgr = card_img_bgr
+    if bgr is None or bgr.size == 0:
+        return False, {"reason": "empty"}
+    H, W = bgr.shape[:2]
+    if H < 40 or W < 40:
         return False, {"reason": "too_small"}
 
-    bw = max(2, int(w * ring_ratio))
-    bh = max(2, int(h * ring_ratio))
-    mask = np.zeros((h, w), dtype=np.uint8)
-    mask[:bh, :] = 1
-    mask[h-bh:, :] = 1
-    mask[:, :bw] = 1
-    mask[:, w-bw:] = 1
+    # light denoise so we don't pick artwork textures as color changes
+    bgr = cv2.bilateralFilter(bgr, 9, 60, 60)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
 
-    hsv = cv2.cvtColor(card_img_bgr, cv2.COLOR_BGR2HSV)
-    Hdeg = hsv[:, :, 0].astype(np.float32) * 2.0
-    S, V = hsv[:, :, 1], hsv[:, :, 2]
+    t = max(1, int(round(min(H, W) * ring_ratio)))
+    m = max(1, int(round(min(H, W) * edge_margin)))
 
-    border_mask = (mask == 1) & (S >= sat_min) & (V >= val_min)
-    if not np.any(border_mask):
-        return False, {"reason": "no_vivid_border"}
+    edges_metrics = []
+    rainbow_ok = 0
+    horiz_ok = False
+    vert_ok = False
 
-    hue_deg = Hdeg[border_mask]
-    hist, _ = np.histogram(hue_deg, bins=18, range=(0, 360))
-    nonzero_bins = int((hist > 0).sum())
-    frac_outside_gold = float(np.mean((hue_deg < gold_low_deg) | (hue_deg > gold_high_deg)))
-    circ_std = _circular_hue_std(hue_deg)
-    # dominant-hue guard: if one bin has most pixels, it's not rainbow
-    dominant_peak_frac = hist.max() / max(1, hist.sum())
+    for edge in ("top", "bottom", "left", "right"):
+        xs, ys = _centerline(edge, H, W, t, m)
+        offsets = _parallel_offsets(t, across_lines)
+        lines = [_sample_line_hues(hsv, xs, ys, edge, off, sat_min, val_min) for off in offsets]
 
-    elite = (
-        (nonzero_bins >= bins_required) and
-        (frac_outside_gold >= frac_outside_gold_min) and
-        (circ_std >= circ_std_min) and
-        (dominant_peak_frac <= 0.70)    # reject single-color borders
-    )
+        # choose the center line for primary stats
+        center_idx = offsets.index(0) if 0 in offsets else len(offsets)//2
+        line_h = lines[center_idx]
+        line_count = int(line_h.size)
+        line_range_deg = _minimal_circular_range_deg(line_h)
+        hm = _line_hist_metrics(line_h, hue_bins, bin_min_frac)
+
+        uw = _unwrap_degrees(line_h)
+        if uw.size >= 2:
+            diffs = np.abs(np.diff(uw))
+            tv = float(np.sum(diffs))
+            big_jump_frac = float(np.mean(diffs >= big_jump_deg)) if diffs.size else 0.0
+            tv_over_range = tv / max(line_range_deg, 1e-6)
+        else:
+            big_jump_frac = 0.0
+            tv_over_range = 0.0
+
+        # across-thickness (perpendicular) hue consistency
+        across_std_list = []
+        if len(lines) >= 2 and line_h.size > 0:
+            n = min(200, line_h.size)
+            idxs = np.linspace(0, line_h.size - 1, n).astype(int)
+            stack = []
+            for L in lines:
+                if L.size == line_h.size:
+                    stack.append(L[idxs])
+                elif L.size == 0:
+                    stack.append(np.full_like(idxs, np.nan, dtype=np.float32))
+                else:
+                    jj = (idxs.astype(np.float32) * (L.size - 1) / max(line_h.size - 1, 1)).astype(int)
+                    stack.append(L[jj])
+            Hstack = np.stack(stack, axis=0)
+            for k in range(Hstack.shape[1]):
+                col = Hstack[:, k]; col = col[~np.isnan(col)]
+                if col.size >= 2:
+                    across_std_list.append(_circular_std_deg(col))
+        across_std_med = float(np.median(across_std_list)) if across_std_list else 999.0
+
+        ok = (
+            line_count >= line_count_min and
+            line_range_deg >= line_range_min_deg and
+            hm["coverage"] >= line_coverage_req and
+            hm["sector_count"] >= line_sector_req and
+            hm["peak_frac"] <= line_peak_max and
+            tv_over_range <= smooth_tv_over_range_max and
+            big_jump_frac <= big_jump_max_frac and
+            across_std_med <= across_std_max_deg
+        )
+
+        edges_metrics.append({
+            "edge": edge, "ok": bool(ok),
+            "line_count": line_count,
+            "line_hue_range_deg": float(line_range_deg),
+            "line_coverage": float(hm["coverage"]),
+            "line_sector_count": int(hm["sector_count"]),
+            "line_peak_frac": float(hm["peak_frac"]),
+            "tv_over_range": float(tv_over_range),
+            "big_jump_frac": float(big_jump_frac),
+            "across_std_med_deg": float(across_std_med),
+        })
+
+        if ok:
+            rainbow_ok += 1
+            if edge in ("top", "bottom"):
+                horiz_ok = True
+            else:
+                vert_ok = True
+
+    elite = (rainbow_ok >= min_rainbow_edges) and (not require_horiz_vert or (horiz_ok and vert_ok))
 
     metrics = {
-        "nonzero_bins": nonzero_bins,
-        "frac_outside_gold": round(frac_outside_gold, 3),
-        "circ_std_deg": round(circ_std, 1),
-        "kept_pixels": int(hue_deg.size),
+        "edges": edges_metrics,
+        "rainbow_edges": rainbow_ok,
+        "passes_horiz": horiz_ok,
+        "passes_vert":  vert_ok,
+        "elite": elite,
+        "thresholds": {
+            "ring_ratio": ring_ratio, "edge_margin": edge_margin,
+            "sat_min": sat_min, "val_min": val_min,
+            "hue_bins": hue_bins, "bin_min_frac": bin_min_frac,
+            "line_range_min_deg": line_range_min_deg,
+            "line_coverage_req": line_coverage_req,
+            "line_sector_req": line_sector_req,
+            "line_peak_max": line_peak_max,
+            "line_count_min": line_count_min,
+            "smooth_tv_over_range_max": smooth_tv_over_range_max,
+            "big_jump_deg": big_jump_deg,
+            "big_jump_max_frac": big_jump_max_frac,
+            "across_lines": across_lines,
+            "across_std_max_deg": across_std_max_deg,
+            "min_rainbow_edges": min_rainbow_edges,
+            "require_horiz_vert": require_horiz_vert,
+        }
     }
     return elite, metrics
 
