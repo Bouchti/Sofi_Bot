@@ -34,6 +34,24 @@ from tkinter.scrolledtext import ScrolledText
 # --------------------------
 READER = None
 
+# ---- Elite detector config (defaults) ----
+ELITE_PARAMS = {
+    "ring_ratio": 0.045,
+    "edge_margin": 0.05,
+    "sat_min": 45,         # requested defaults
+    "val_min": 60,         # requested defaults
+    "hue_bins": 36,
+    "edge_nonzero_bins_min": 8,
+    "edge_peak_max": 0.55,
+    "edge_cstd_min": 40.0, # requested default
+    "edge_count_min": 120,
+    "global_nonzero_bins_min": 12,
+    "global_peak_max": 0.60,
+    # keep the algo the same:
+    "cluster_min_frac": 0.12,
+    "cluster_min_sep": 45.0,
+}
+
 # --------------------------
 # Logging setup (adds GUI handler later)
 # --------------------------
@@ -161,234 +179,257 @@ def extract_generation_with_easyocr(image):
     name, series = extract_card_name_and_series(extracted_text)
     return generations, name, series
 
-# --- Elite detector: rainbow frame only ---------------------------------------
-# Uses along-edge centerline sampling to verify a continuous hue sweep.
-# Returns (elite_bool, metrics_dict)  — signature preserved for callers.
+# --- Elite detector: robust rainbow-frame classifier with per-edge gating -----
 
-def _minimal_circular_range_deg(h_arr: np.ndarray) -> float:
-    if h_arr.size == 0:
-        return 0.0
-    d = np.sort(h_arr.astype(np.float32) * 2.0)  # OpenCV hue→degrees (0..360)
-    gaps = np.diff(np.r_[d, d[0] + 360.0])
-    largest_gap = float(np.max(gaps)) if gaps.size else 0.0
-    return 360.0 - largest_gap
+# ---------- card segmentation (robust & rectangle-friendly) ----------
+def _segment_card_mask(col_bgr):
+    """
+    Segment the single card region inside a column.
+    Returns a binary mask (uint8) covering the FULL card area.
+    """
+    h, w = col_bgr.shape[:2]
 
-def _circular_std_deg(h_arr: np.ndarray) -> float:
-    if h_arr.size == 0:
-        return 0.0
-    ang = (h_arr.astype(np.float32) * 2.0) * (np.pi / 180.0)
-    s = np.sin(ang).sum()
-    c = np.cos(ang).sum()
-    n = float(h_arr.size)
-    R = np.sqrt(s*s + c*c) / max(n, 1.0)
-    R = float(np.clip(R, 1e-6, 0.999999))
-    return float(np.sqrt(-2.0 * np.log(R)) * (180.0 / np.pi))
+    # 1) gentle denoise (preserve edges), then edge extraction
+    gray = cv2.cvtColor(col_bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 40, 120)
 
-def _unwrap_degrees(seq_deg: np.ndarray) -> np.ndarray:
-    if seq_deg.size == 0:
-        return seq_deg.astype(np.float32)
-    s = seq_deg.astype(np.float32) * 2.0
-    out = [s[0]]
-    for v in s[1:]:
-        base = out[-1]
-        cand = np.array([v-360.0, v, v+360.0], dtype=np.float32)
-        out.append(cand[np.argmin(np.abs(cand - base))])
-    return np.array(out, dtype=np.float32)
+    # 2) also threshold by brightness to keep card area
+    th = cv2.adaptiveThreshold(
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 41, -5
+    )
 
-def _line_hist_metrics(h_arr: np.ndarray, hue_bins: int, bin_min_frac: float):
-    if h_arr.size == 0:
-        return dict(nonzero_bins=0, coverage=0.0, peak_frac=1.0, sector_count=0)
-    hist, _ = np.histogram(h_arr, bins=hue_bins, range=(0, 180))
-    total = float(hist.sum())
-    peak_frac = float(hist.max() / total) if total > 0 else 1.0
-    bin_frac = hist / max(total, 1.0)
-    active = (bin_frac > bin_min_frac)
-    nonzero_bins = int(active.sum())
-    coverage = nonzero_bins / float(hue_bins)
-    extended = np.r_[active, active[0]]
-    sector_count = int(np.sum(extended[1:] & ~extended[:-1]))
-    return dict(nonzero_bins=nonzero_bins, coverage=coverage,
-                peak_frac=peak_frac, sector_count=sector_count)
+    # combine and clean
+    mix = cv2.bitwise_or(th, edges)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    mix = cv2.morphologyEx(mix, cv2.MORPH_CLOSE, k, iterations=2)
+    mix = cv2.morphologyEx(mix, cv2.MORPH_OPEN,  k, iterations=1)
 
-def _centerline(edge, H, W, t, m):
-    if edge == 'top':
-        y = int(np.clip(m + t // 2, 0, H - 1)); xs = np.arange(W); ys = np.full_like(xs, y)
-    elif edge == 'bottom':
-        y = int(np.clip(H - m - t // 2 - 1, 0, H - 1)); xs = np.arange(W); ys = np.full_like(xs, y)
-    elif edge == 'left':
-        x = int(np.clip(m + t // 2, 0, W - 1)); ys = np.arange(H); xs = np.full_like(ys, x)
-    else:  # right
-        x = int(np.clip(W - m - t // 2 - 1, 0, W - 1)); ys = np.arange(H); xs = np.full_like(ys, x)
-    return xs, ys
+    cnts, _ = cv2.findContours(mix, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    mask = np.zeros((h, w), np.uint8)
+    if not cnts:
+        return mask
 
-def _parallel_offsets(t, num_lines):
-    if num_lines <= 1:
-        return [0]
-    offs = np.linspace(-max(1, t // 4), max(1, t // 4), num_lines).astype(int)
-    return list(np.unique(offs))
+    # largest contour → convex hull → fill → one more close
+    big = max(cnts, key=cv2.contourArea)
+    hull = cv2.convexHull(big)
+    cv2.drawContours(mask, [hull], -1, 255, -1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
+    return mask
 
-def _sample_line_hues(hsv, xs, ys, edge, off, sat_min, val_min):
-    H, W = hsv.shape[:2]
-    if edge in ('top', 'bottom'):
-        y = np.clip(ys + off, 0, H - 1)
-        h = hsv[y, xs, 0]; s = hsv[y, xs, 1]; v = hsv[y, xs, 2]
+
+# ---------- build thin frame strips from card mask ----------
+def _make_frame_strips(raw_card_mask, bottom_exclude=0.22, inset_ratio=0.012, thick_ratio=0.032):
+    """
+    Creates a thin 'ring' mask hugging the inner border of the card, and
+    returns band rectangles for top/left/right (used for debugging/vis).
+    """
+    h, w = raw_card_mask.shape[:2]
+    ys, xs = np.where(raw_card_mask > 0)
+    if xs.size == 0:
+        return np.zeros_like(raw_card_mask), {}
+
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    cw, ch = (x1 - x0 + 1), (y1 - y0 + 1)
+
+    inset = max(2, int(round(min(cw, ch) * inset_ratio)))
+    thick = max(2, int(round(min(cw, ch) * thick_ratio)))
+    y_cap = y0 + int(round((1.0 - bottom_exclude) * ch))
+
+    def clamp(a, lo, hi): return max(lo, min(hi, a))
+
+    top = (clamp(x0 + inset, 0, w - 1),
+           clamp(y0 + inset, 0, h - 1),
+           clamp(x1 - inset - (x0 + inset), 0, w - 1),
+           clamp((y0 + inset + thick) - (y0 + inset), 0, h - 1))
+
+    left = (clamp(x0 + inset, 0, w - 1),
+            clamp(y0 + inset, 0, h - 1),
+            clamp((x0 + inset + thick) - (x0 + inset), 0, w - 1),
+            clamp((y_cap - inset) - (y0 + inset), 0, h - 1))
+
+    right = (clamp(x1 - inset - thick + 1, 0, w - 1),
+             clamp(y0 + inset, 0, h - 1),
+             clamp(thick, 0, w - 1),
+             clamp((y_cap - inset) - (y0 + inset), 0, h - 1))
+
+    union = np.zeros_like(raw_card_mask, np.uint8)
+    bands_info = {"top": top, "left": left, "right": right}
+    for (x, y, ww, hh) in (top, left, right):
+        if ww > 1 and hh > 1:
+            union[y:y + hh, x:x + ww] = 255
+    return union, bands_info
+
+
+# ---------- per-edge metrics (strict gate) ----------
+def _edge_metrics(Hdeg, S, V, h, w, side,
+                  ring_ratio=ELITE_PARAMS["ring_ratio"],
+                  edge_margin=ELITE_PARAMS["edge_margin"],
+                  sat_min=None, val_min=None, hue_bins=ELITE_PARAMS["hue_bins"],
+                  edge_nonzero_bins_min=ELITE_PARAMS["edge_nonzero_bins_min"],
+                  edge_peak_max=ELITE_PARAMS["edge_peak_max"],
+                  edge_cstd_min=None,
+                  edge_count_min=ELITE_PARAMS["edge_count_min"]):
+    """
+    Measure hue diversity on a single edge. Hdeg is hue in degrees (0..360).
+    Uses ELITE_PARAMS for thresholds unless explicitly overridden.
+    """
+    if sat_min is None: sat_min = ELITE_PARAMS["sat_min"]
+    if val_min is None: val_min = ELITE_PARAMS["val_min"]
+    if edge_cstd_min is None: edge_cstd_min = ELITE_PARAMS["edge_cstd_min"]
+
+    thick_x = max(2, int(w * ring_ratio))
+    thick_y = max(2, int(h * ring_ratio))
+    mx = max(1, int(w * edge_margin))
+    my = max(1, int(h * edge_margin))
+    if side == "top":
+        rr, cc = slice(0, thick_y), slice(mx, w - mx)
+    elif side == "bottom":
+        rr, cc = slice(h - thick_y, h), slice(mx, w - mx)
+    elif side == "left":
+        rr, cc = slice(my, h - my), slice(0, thick_x)
     else:
-        x = np.clip(xs + off, 0, W - 1)
-        h = hsv[ys, x, 0]; s = hsv[ys, x, 1]; v = hsv[ys, x, 2]
-    mask = (s >= sat_min) & (v >= val_min)
-    return h[mask].astype(np.float32)
+        rr, cc = slice(my, h - my), slice(w - thick_x, w)
 
-def is_elite_card(
-    card_img_bgr: np.ndarray,
-    # geometry
-    ring_ratio: float = 0.06,
-    edge_margin: float = 0.03,
-    # vivid gate
-    sat_min: int = 60,
-    val_min: int = 75,
-    # hue hist
-    hue_bins: int = 36,
-    bin_min_frac: float = 0.02,
-    # along-edge rainbow gates
-    line_range_min_deg: float = 180.0,
-    line_coverage_req: float = 0.10,   # tuned to catch thin rainbows
-    line_sector_req: int = 2,
-    line_peak_max: float = 0.55,
-    line_count_min: int = 120,
-    # smoothness + across-thickness consistency
-    smooth_tv_over_range_max: float = 5.0,
-    big_jump_deg: float = 45.0,
-    big_jump_max_frac: float = 0.20,
-    across_lines: int = 5,
-    across_std_max_deg: float = 15.0,
-    # card aggregation
-    min_rainbow_edges: int = 2,
-    require_horiz_vert: bool = True,
-):
+    m = (S[rr, cc] >= sat_min) & (V[rr, cc] >= val_min)
+    hue = Hdeg[rr, cc][m].astype(np.float32)
+    if hue.size == 0:
+        return dict(ok=False, nonzero=0, peak=1.0, cstd=0.0, n=0)
+
+    hist, _ = np.histogram(hue, bins=hue_bins, range=(0, 360))
+    total = float(hist.sum())
+    peak = float(hist.max() / max(1.0, total))
+    nonzero = int((hist > 0).sum())
+
+    # circular std (proper formula, in degrees)
+    ang = np.deg2rad(hue)
+    s, c = np.sin(ang).sum(), np.cos(ang).sum()
+    R = np.sqrt(s*s + c*c) / max(1.0, hue.size)
+    R = float(np.clip(R, 1e-6, 0.999999))
+    cstd = float(np.degrees(np.sqrt(-2.0 * np.log(R))))
+
+    ok = (hue.size >= edge_count_min and
+          nonzero >= edge_nonzero_bins_min and
+          peak <= edge_peak_max and
+          cstd >= float(edge_cstd_min))
+    return dict(ok=ok, nonzero=nonzero, peak=peak, cstd=cstd, n=int(hue.size))
+
+
+# ---------- classifier (edge gate + hue kmeans + Lab confirmation) ----------
+def _classify_ring(card_bgr, ring_mask, bands_info):
     """
-    Return (elite_bool, metrics_dict).
-    Elite == card frame shows a rainbow gradient on at least two edges
-    (and at least one horizontal + one vertical if require_horiz_vert=True).
+    Core ELITE decision:
+      1) strict per-edge hue-diversity gate (reject solids),
+      2) k-means on hue circle (needs 3 balanced clusters & wide separation),
+      3) Lab-space spread/compactness confirmation.
+    Returns (elite: bool, score: float, debug: dict)
     """
-    bgr = card_img_bgr
-    if bgr is None or bgr.size == 0:
-        return False, {"reason": "empty"}
-    H, W = bgr.shape[:2]
-    if H < 40 or W < 40:
-        return False, {"reason": "too_small"}
+    if ring_mask.sum() < 200:
+        return False, 0.0, {"reason": "no_ring"}
 
-    # light denoise so we don't pick artwork textures as color changes
-    bgr = cv2.bilateralFilter(bgr, 9, 60, 60)
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    hsv = cv2.cvtColor(card_bgr, cv2.COLOR_BGR2HSV)
+    Hdeg = hsv[..., 0].astype(np.float32) * 2.0
+    S = hsv[..., 1]; V = hsv[..., 2]
+    h, w = card_bgr.shape[:2]
 
-    t = max(1, int(round(min(H, W) * ring_ratio)))
-    m = max(1, int(round(min(H, W) * edge_margin)))
+    # 1) strict per-edge gate (now using ELITE_PARAMS thresholds)
+    mt = _edge_metrics(Hdeg, S, V, h, w, "top")
+    mb = _edge_metrics(Hdeg, S, V, h, w, "bottom")
+    ml = _edge_metrics(Hdeg, S, V, h, w, "left")
+    mr = _edge_metrics(Hdeg, S, V, h, w, "right")
 
-    edges_metrics = []
-    rainbow_ok = 0
-    horiz_ok = False
-    vert_ok = False
+    ok_top, ok_bottom, ok_left, ok_right = mt["ok"], mb["ok"], ml["ok"], mr["ok"]
+    enough_edges = ((ok_top and ok_bottom) or (ok_left and ok_right) or
+                    (sum([ok_top, ok_bottom, ok_left, ok_right]) >= 3))
+    if not enough_edges:
+        dbg = {"edges": {"top": mt, "bottom": mb, "left": ml, "right": mr}, "gate": "edge_fail"}
+        return False, 0.0, dbg
 
-    for edge in ("top", "bottom", "left", "right"):
-        xs, ys = _centerline(edge, H, W, t, m)
-        offsets = _parallel_offsets(t, across_lines)
-        lines = [_sample_line_hues(hsv, xs, ys, edge, off, sat_min, val_min) for off in offsets]
+    # 2) hue k-means on ring pixels
+    mm = ring_mask > 0
+    hdeg = Hdeg[mm]; s = (S[mm] / 255.0); v = (V[mm] / 255.0)
+    theta = np.deg2rad(hdeg)
+    X = np.stack([np.cos(theta), np.sin(theta)], 1).astype(np.float32)
+    wts = np.clip(1.2 * s + 0.4 * v, 0.0, 1.0).astype(np.float32)
+    Xw = (X * wts[:, None]).astype(np.float32)
 
-        # choose the center line for primary stats
-        center_idx = offsets.index(0) if 0 in offsets else len(offsets)//2
-        line_h = lines[center_idx]
-        line_count = int(line_h.size)
-        line_range_deg = _minimal_circular_range_deg(line_h)
-        hm = _line_hist_metrics(line_h, hue_bins, bin_min_frac)
+    term = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-3)
+    _, labels, centers = cv2.kmeans(Xw, 3, None, term, 5, cv2.KMEANS_PP_CENTERS)
+    counts = np.bincount(labels.flatten(), minlength=3).astype(np.float32)
+    props = (counts / (counts.sum() + 1e-6)).astype(np.float32)
+    order = np.argsort(-props); props, centers = props[order], centers[order]
+    centers_deg = (np.degrees(np.arctan2(centers[:, 1], centers[:, 0])) + 360.0) % 360.0
 
-        uw = _unwrap_degrees(line_h)
-        if uw.size >= 2:
-            diffs = np.abs(np.diff(uw))
-            tv = float(np.sum(diffs))
-            big_jump_frac = float(np.mean(diffs >= big_jump_deg)) if diffs.size else 0.0
-            tv_over_range = tv / max(line_range_deg, 1e-6)
-        else:
-            big_jump_frac = 0.0
-            tv_over_range = 0.0
+    def _angsep(a, b):
+        d = abs(a - b) % 360.0
+        return d if d <= 180.0 else 360.0 - d
 
-        # across-thickness (perpendicular) hue consistency
-        across_std_list = []
-        if len(lines) >= 2 and line_h.size > 0:
-            n = min(200, line_h.size)
-            idxs = np.linspace(0, line_h.size - 1, n).astype(int)
-            stack = []
-            for L in lines:
-                if L.size == line_h.size:
-                    stack.append(L[idxs])
-                elif L.size == 0:
-                    stack.append(np.full_like(idxs, np.nan, dtype=np.float32))
-                else:
-                    jj = (idxs.astype(np.float32) * (L.size - 1) / max(line_h.size - 1, 1)).astype(int)
-                    stack.append(L[jj])
-            Hstack = np.stack(stack, axis=0)
-            for k in range(Hstack.shape[1]):
-                col = Hstack[:, k]; col = col[~np.isnan(col)]
-                if col.size >= 2:
-                    across_std_list.append(_circular_std_deg(col))
-        across_std_med = float(np.median(across_std_list)) if across_std_list else 999.0
+    min_sep = float(min(_angsep(centers_deg[i], centers_deg[j])
+                        for i in range(3) for j in range(i+1, 3)))
 
-        ok = (
-            line_count >= line_count_min and
-            line_range_deg >= line_range_min_deg and
-            hm["coverage"] >= line_coverage_req and
-            hm["sector_count"] >= line_sector_req and
-            hm["peak_frac"] <= line_peak_max and
-            tv_over_range <= smooth_tv_over_range_max and
-            big_jump_frac <= big_jump_max_frac and
-            across_std_med <= across_std_max_deg
-        )
+    # dominant-hue veto (bright solid frames)
+    if props[0] >= 0.62 and min_sep < 60.0:
+        dbg = {"edges": {"top": mt, "bottom": mb, "left": ml, "right": mr},
+               "props": [float(p) for p in props], "min_sep": min_sep, "gate": "dominant_veto"}
+        return False, 0.0, dbg
 
-        edges_metrics.append({
-            "edge": edge, "ok": bool(ok),
-            "line_count": line_count,
-            "line_hue_range_deg": float(line_range_deg),
-            "line_coverage": float(hm["coverage"]),
-            "line_sector_count": int(hm["sector_count"]),
-            "line_peak_frac": float(hm["peak_frac"]),
-            "tv_over_range": float(tv_over_range),
-            "big_jump_frac": float(big_jump_frac),
-            "across_std_med_deg": float(across_std_med),
-        })
+    # 3) Lab spread / compactness
+    lab = cv2.cvtColor(card_bgr, cv2.COLOR_BGR2LAB)
+    a = (lab[..., 1].astype(np.float32) - 128.0)[mm]
+    b = (lab[..., 2].astype(np.float32) - 128.0)[mm]
+    ab = np.stack([a, b], 1).astype(np.float32)
 
-        if ok:
-            rainbow_ok += 1
-            if edge in ("top", "bottom"):
-                horiz_ok = True
-            else:
-                vert_ok = True
+    try:
+        hull = cv2.convexHull(ab); hull_area = float(cv2.contourArea(hull))
+    except Exception:
+        hull_area = 0.0
+    hull_norm = hull_area / (256.0 * 256.0)
 
-    elite = (rainbow_ok >= min_rainbow_edges) and (not require_horiz_vert or (horiz_ok and vert_ok))
+    tcrit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.1)
+    sse1, _, _ = cv2.kmeans(ab, 1, None, tcrit, 3, cv2.KMEANS_PP_CENTERS)
+    sse3, _, _ = cv2.kmeans(ab, 3, None, tcrit, 3, cv2.KMEANS_PP_CENTERS)
+    sse1 = float(sse1) if np.isscalar(sse1) else float(np.sum(sse1))
+    sse3 = float(sse3) if np.isscalar(sse3) else float(np.sum(sse3))
+    k_gain = max(0.0, (sse1 - sse3) / (sse1 + 1e-6))
 
-    metrics = {
-        "edges": edges_metrics,
-        "rainbow_edges": rainbow_ok,
-        "passes_horiz": horiz_ok,
-        "passes_vert":  vert_ok,
-        "elite": elite,
-        "thresholds": {
-            "ring_ratio": ring_ratio, "edge_margin": edge_margin,
-            "sat_min": sat_min, "val_min": val_min,
-            "hue_bins": hue_bins, "bin_min_frac": bin_min_frac,
-            "line_range_min_deg": line_range_min_deg,
-            "line_coverage_req": line_coverage_req,
-            "line_sector_req": line_sector_req,
-            "line_peak_max": line_peak_max,
-            "line_count_min": line_count_min,
-            "smooth_tv_over_range_max": smooth_tv_over_range_max,
-            "big_jump_deg": big_jump_deg,
-            "big_jump_max_frac": big_jump_max_frac,
-            "across_lines": across_lines,
-            "across_std_max_deg": across_std_max_deg,
-            "min_rainbow_edges": min_rainbow_edges,
-            "require_horiz_vert": require_horiz_vert,
-        }
+    # final decision
+    elite = bool((np.sum(props >= ELITE_PARAMS["cluster_min_frac"]) >= 3) and
+                 (min_sep >= ELITE_PARAMS["cluster_min_sep"]) and
+                 (hull_norm >= 0.020 or k_gain >= 0.45))
+
+    balance = float(np.clip((np.min(props[:3]) - ELITE_PARAMS["cluster_min_frac"]) / 0.28, 0.0, 1.0)) \
+              if np.sum(props >= ELITE_PARAMS["cluster_min_frac"]) >= 3 else 0.0
+    score = (0.22 * min(1.0, min_sep / 120.0) +
+             0.20 * balance +
+             0.20 * min(1.0, hull_norm / 0.06) +
+             0.20 * min(1.0, k_gain / 0.70) +
+             0.18 * min(1.0, (mt["cstd"] + mb["cstd"] + ml["cstd"] + mr["cstd"]) / (4 * 120.0)))
+
+    dbg = {
+        "edges": {"top": mt, "bottom": mb, "left": ml, "right": mr},
+        "props": [round(float(p), 3) for p in props.tolist()],
+        "centers": [round(float(a), 1) for a in centers_deg.tolist()],
+        "min_sep": round(min_sep, 1),
+        "hull_norm": round(hull_norm, 4),
+        "kmeans_gain": round(k_gain, 3),
     }
-    return elite, metrics
+    return elite, float(score), dbg
+
+
+def is_elite_card(card_img_bgr):
+    if card_img_bgr is None or card_img_bgr.size == 0:
+        return False, {"reason": "empty"}
+
+    raw_card_mask = _segment_card_mask(card_img_bgr)
+    ring_mask, bands_info = _make_frame_strips(raw_card_mask, bottom_exclude=0.22)
+    if ring_mask.sum() == 0:
+        return False, {"reason": "no_card"}
+
+    elite, score, dbg = _classify_ring(card_img_bgr, ring_mask, bands_info)
+    dbg["score"] = round(float(score), 3)
+    return elite, dbg
+
 
 def extract_card_for_index(index, card_crop):
     try:
@@ -558,6 +599,20 @@ class SofiBotManager:
         self.SD_INTERVAL_SEC = int(os.getenv("SD_INTERVAL_SEC", "480"))
         self.USE_GPU = (os.getenv("OCR_USE_GPU", "0") == "1")
 
+                   # ---- lifecycle guards (avoid duplicate restarts/threads) ----
+        self._running = False                 # single bot instance flag
+        self._restart_in_progress = False     # single-flight restart flag
+        self._restart_lock = threading.Lock() # protects restart section
+
+        # ---- Optional env overrides for elite thresholds
+        try:
+            ELITE_PARAMS["sat_min"] = int(os.getenv("ELITE_SAT_MIN", str(ELITE_PARAMS["sat_min"])))
+            ELITE_PARAMS["val_min"] = int(os.getenv("ELITE_VAL_MIN", str(ELITE_PARAMS["val_min"])))
+            ELITE_PARAMS["edge_cstd_min"] = float(os.getenv("ELITE_EDGE_CSTD_MIN", str(ELITE_PARAMS["edge_cstd_min"])))
+        except Exception:
+            # keep defaults if parsing fails
+            pass
+
         # preferences
         prefs_raw = os.getenv("PREFERENCES", "no_gen,low_gen,high_likes,series_match")
         self.preferences = [p.strip().lower() for p in prefs_raw.split(",") if p.strip()]
@@ -577,8 +632,8 @@ class SofiBotManager:
             elapsed = time.time() - self.last_message_received
             if elapsed > self.WATCHDOG_TIMEOUT:
                 logging.error(f"🛑 No message received for {elapsed:.1f}s. Restarting bot (soft)…")
-                self.restart_bot()
-                return  # let new watchdog start in restart_bot
+                self.restart_bot()   # single-flight guarded
+                return
 
     def reset_claim_if_timed_out(self):
         while not self.stop_event.is_set():
@@ -655,13 +710,31 @@ class SofiBotManager:
 
         card_info = extract_card_generations(pil_image)
 
-        # ----- Build per-card metadata once -----
+        # ---- If any elite exists, click it NOW (fast), then log likes for all cards
+        elite_choice = next((i for i in range(card_count) if card_info.get(i, {}).get("elite")), None)
+        if elite_choice is not None:
+            self.click_discord_button(button_ids[elite_choice], channel_id, guild_id, m)
+            logging.info(f"✅ Claimed card {elite_choice+1} (🌈 ELITE 🌈)")
+            # Print likes/info for all cards (non-blocking for the click)
+            for i in range(card_count):
+                info = card_info.get(i, {})
+                gens = info.get("generations", {}) or {}
+                name = info.get("name") or ""
+                series = info.get("series") or ""
+                match_score, match_idx, likes, matched_name, matched_series = find_best_character_match(
+                    name, series, self.TOP_CHARACTERS_LIST
+                )
+                disp_name = matched_name or name or "(unknown)"
+                disp_series = matched_series or series or ""
+                logging.info(
+                    f"[Card {i+1}] likes={likes or 0} | gens={list(gens.keys()) or '∅'} "
+                    f"| name='{disp_name}' | series='{disp_series}'"
+                )
+            return
+
+        # ----- Build per-card metadata once (and log likes/info)
         cards = []
         for i in range(card_count):
-            if card_info.get(i, {}).get("elite"):
-                self.click_discord_button(button_ids[i], channel_id, guild_id, m)
-                logging.info(f"✅ Claimed card {i+1} (🌈 ELITE 🌈)")
-                return
             info = card_info.get(i, {})
             gens = info.get("generations", {}) or {}
             name = info.get("name") or ""
@@ -678,10 +751,20 @@ class SofiBotManager:
                 "min_gen": min(gens.values()) if gens else None,
                 "name": name,
                 "series": series,
+                "matched_name": matched_name,
+                "matched_series": matched_series,
                 "match_score": match_score if match_score is not None else 0,
                 "likes": likes or 0,
-                "matched_series": (matched_series or "")
             })
+
+        # Print a clean summary line for each card with likes
+        for c in cards:
+            disp_name = c["matched_name"] or c["name"] or "(unknown)"
+            disp_series = c["matched_series"] or c["series"] or ""
+            logging.info(
+                f"[Card {c['index']+1}] likes={c['likes']} | gens={list(c['gens'].keys()) or '∅'} "
+                f"| name='{disp_name}' | series='{disp_series}' | match={c['match_score']}%"
+            )
 
         # 🚨 Absolute rule: if any card has generation < 10, choose it now (ignore preferences)
         low_gen_candidates = [c for c in cards if c["min_gen"] is not None and c["min_gen"] < 10]
@@ -711,25 +794,23 @@ class SofiBotManager:
             logging.info(f"✅ Claimed card {chosen_index+1} (⚡ generation < 10: G{chosen['min_gen']} ⚡) in {elapsed_time:.2f}s")
             return
 
+        # ---- Apply preferences as before
         def filter_by_pref(candidates, pref):
             if pref == "no_gen":
                 kept = [c for c in candidates if not c["has_gen"]]
                 return kept if kept else candidates
-
             if pref == "low_gen":
                 with_gen = [c for c in candidates if c["min_gen"] is not None]
                 if not with_gen:
                     return candidates
                 minval = min(c["min_gen"] for c in with_gen)
                 return [c for c in with_gen if c["min_gen"] == minval]
-
             if pref == "high_likes":
                 with_likes = [c for c in candidates if c["likes"] > 0]
                 if not with_likes:
                     return candidates
                 maxlikes = max(c["likes"] for c in with_likes)
                 return [c for c in with_likes if c["likes"] == maxlikes]
-
             if pref == "series_match":
                 key = (self.series_preference or "").strip().lower()
                 if not key:
@@ -740,7 +821,6 @@ class SofiBotManager:
                     or key in (c["series"] or "").lower()
                 ]
                 return matched if matched else candidates
-
             return candidates
 
         candidates = cards[:]
@@ -761,7 +841,6 @@ class SofiBotManager:
             return
 
         chosen_index = chosen["index"]
-
         now = time.time()
         generations = chosen.get("gens", {})
 
@@ -890,9 +969,12 @@ class SofiBotManager:
 
     def start(self):
         global READER
-        if self.bot_thread and self.bot_thread.is_alive():
-            logging.info("Bot already running.")
+
+        # prevent double-start
+        if self._running:
+            logging.info("Bot already running; start() ignored.")
             return
+        self._running = True
 
         # Init OCR (download on first run). Default: CPU (packaging-friendly)
         logging.info(f"Initializing EasyOCR (gpu={self.USE_GPU}) …")
@@ -933,66 +1015,93 @@ class SofiBotManager:
         self.bot_thread.start()
 
     def stop(self):
+        if not self._running:
+            return
         logging.info("Stopping bot …")
+        self._running = False
+
+        # signal all helpers to exit
         self.stop_event.set()
+
+        # close gateway/client if present
         try:
             if self.bot and self.bot.gateway:
                 self.bot.gateway.close()
         except Exception:
             pass
-        # try to join helper threads quickly
-        for t in (self.sd_thread, self.ka_thread, self.watchdog_thread, self.claim_timeout_thread, self.bot_thread):
+
+        # join helpers quickly
+        for attr in ("sd_thread", "ka_thread", "watchdog_thread",
+                     "claim_timeout_thread", "bot_thread"):
+            t = getattr(self, attr, None)
             try:
                 if t and t.is_alive():
                     t.join(timeout=2.0)
             except Exception:
                 pass
+            setattr(self, attr, None)  # ensure we can't reuse the old ref
+
         logging.info("Bot stopped.")
 
     # ---- NEW: soft restart (no process restart) ----
     def restart_bot(self):
+        # only one restart at a time
+        with self._restart_lock:
+            if self._restart_in_progress:
+                logging.info("Restart already in progress; skipping.")
+                return
+            self._restart_in_progress = True
+
         logging.info("🔄 Soft-restarting bot …")
         try:
-            self.stop()
-        except Exception:
-            pass
-
-        # reset flags/state but keep OCR reader
-        self.stop_event = threading.Event()
-        self.pending_claim["triggered"] = False
-        self.sent_initial_sd = False
-        self.bot_identity_logged = False
-        self.last_message_received = time.time()
-
-        # recreate Discum client and handlers
-        try:
-            self.bot = discum.Client(token=self.TOKEN, log=False)
-            self._install_handlers()
-        except Exception as e:
-            logging.error(f"Failed to re-create Discum client: {e}")
-            return
-
-        # restart helper threads
-        self.sd_thread = threading.Thread(target=self.periodic_sd_sender, daemon=True)
-        self.ka_thread = threading.Thread(target=self.keep_alive, daemon=True)
-        self.watchdog_thread = threading.Thread(target=self.message_watchdog, daemon=True)
-        self.claim_timeout_thread = threading.Thread(target=self.reset_claim_if_timed_out, daemon=True)
-
-        self.sd_thread.start()
-        self.ka_thread.start()
-        self.watchdog_thread.start()
-        self.claim_timeout_thread.start()
-
-        # restart gateway
-        def run_gateway():
-            logging.info("Reconnecting to Discord gateway …")
+            # stop current instance (if any)
             try:
-                self.bot.gateway.run(auto_reconnect=True)
-            except Exception as e:
-                logging.critical(f"Failed to reconnect to Discord gateway: {e}")
+                self.stop()
+            except Exception:
+                pass
 
-        self.bot_thread = threading.Thread(target=run_gateway, daemon=True)
-        self.bot_thread.start()
+            # reset flags/state but keep OCR reader warm
+            self.stop_event = threading.Event()
+            self.pending_claim["triggered"] = False
+            self.sent_initial_sd = False
+            self.bot_identity_logged = False
+            self.last_message_received = time.time()
+
+            # fresh Discum client + handlers
+            try:
+                self.bot = discum.Client(token=self.TOKEN, log=False)
+                self._install_handlers()
+            except Exception as e:
+                logging.error(f"Failed to re-create Discum client: {e}")
+                return
+
+            # restart helper threads
+            self.sd_thread = threading.Thread(target=self.periodic_sd_sender, daemon=True)
+            self.ka_thread = threading.Thread(target=self.keep_alive, daemon=True)
+            self.watchdog_thread = threading.Thread(target=self.message_watchdog, daemon=True)
+            self.claim_timeout_thread = threading.Thread(target=self.reset_claim_if_timed_out, daemon=True)
+
+            self.sd_thread.start()
+            self.ka_thread.start()
+            self.watchdog_thread.start()
+            self.claim_timeout_thread.start()
+
+            # restart gateway
+            def run_gateway():
+                logging.info("Reconnecting to Discord gateway …")
+                try:
+                    self.bot.gateway.run(auto_reconnect=True)
+                except Exception as e:
+                    logging.critical(f"Failed to reconnect to Discord gateway: {e}")
+
+            self.bot_thread = threading.Thread(target=run_gateway, daemon=True)
+            self.bot_thread.start()
+
+            self._running = True
+        finally:
+            # release single-flight flag
+            with self._restart_lock:
+                self._restart_in_progress = False
 
     # (kept for reference; not used anymore)
     def restart_process(self):
@@ -1010,6 +1119,10 @@ class SofiBotManager:
             "OCR_USE_GPU": "1" if self.USE_GPU else "0",
             "PREFERENCES": ",".join(self.preferences),
             "SERIES_NAME": self.series_preference,
+            # optional elite overrides
+            "ELITE_SAT_MIN": str(ELITE_PARAMS["sat_min"]),
+            "ELITE_VAL_MIN": str(ELITE_PARAMS["val_min"]),
+            "ELITE_EDGE_CSTD_MIN": str(ELITE_PARAMS["edge_cstd_min"]),
         }
         with open(self.cfg_path, "w", encoding="utf-8") as f:
             for k, v in data.items():
@@ -1075,6 +1188,7 @@ class SofiApp(tk.Tk):
         signal.signal(signal.SIGTERM, self._signal_handler)
         self._start()
         self._tick_status()
+ 
 
     def _build_ui(self):
         pad = {"padx": 8, "pady": 6}
@@ -1177,11 +1291,11 @@ class SofiApp(tk.Tk):
         self.txt_log = ScrolledText(frm_log, height=24, state="disabled")
         self.txt_log.pack(fill="both", expand=True, padx=6, pady=6)
 
-        self.txt_log.tag_config("DEBUG",    foreground="#6b7280")  # slate-500
-        self.txt_log.tag_config("INFO",     foreground="#2563eb")  # blue-600
-        self.txt_log.tag_config("WARNING",  foreground="#d97706")  # amber-600
-        self.txt_log.tag_config("ERROR",    foreground="#dc2626")  # red-600
-        self.txt_log.tag_config("CRITICAL", foreground="#ffffff", background="#b91c1c")  # white on red
+        self.txt_log.tag_config("DEBUG",    foreground="#6b7280")
+        self.txt_log.tag_config("INFO",     foreground="#2563eb")
+        self.txt_log.tag_config("WARNING",  foreground="#d97706")
+        self.txt_log.tag_config("ERROR",    foreground="#dc2626")
+        self.txt_log.tag_config("CRITICAL", foreground="#ffffff", background="#b91c1c")
         self.txt_log.tag_config("CRITICAL", font=("TkDefaultFont", 9, "bold"))
 
         # Footer
