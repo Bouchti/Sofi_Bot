@@ -603,6 +603,7 @@ class SofiBotManager:
         self._running = False                 # single bot instance flag
         self._restart_in_progress = False     # single-flight restart flag
         self._restart_lock = threading.Lock() # protects restart section
+        self._run_token = 0  # increments on every (re)start
 
         # ---- Optional env overrides for elite thresholds
         try:
@@ -643,19 +644,31 @@ class SofiBotManager:
                 self.pending_claim["triggered"] = False
 
     def periodic_sd_sender(self):
-        """Wait until initial 'sd' is sent (in on_ready), then send every ~8 minutes."""
+        """Send 'sd' roughly every SD_INTERVAL_SEC (never less than 300s)."""
+        run_token = self._run_token  # capture my generation
+        # Wait until on_ready sent the first 'sd'
         while not self.stop_event.is_set() and not self.sent_initial_sd:
             time.sleep(0.2)
+            if run_token != self._run_token:
+                return  # superseded by restart
 
         while not self.stop_event.is_set():
-            wait_time = float(self.SD_INTERVAL_SEC) + random.uniform(0, 10)
+            # hard floor so we never spam
+            base = float(self.SD_INTERVAL_SEC)
+            wait_time = max(300.0, base + random.uniform(0, 10))
+
             logging.info(f"⏳ Waiting {wait_time:.1f}s before sending next 'sd'…")
-            self.stop_event.wait(wait_time)
-            if self.stop_event.is_set():
+            # Use wait() so we can be interrupted by stop_event
+            if self.stop_event.wait(wait_time):
                 break
-            if not self.bot or not self.bot.gateway.session_id:
+            if run_token != self._run_token:
+                return  # superseded by restart
+
+            # double check gateway is alive
+            if not self.bot or not getattr(self.bot.gateway, "session_id", None):
                 logging.warning("⚠️ Gateway session missing. Skipping 'sd'.")
                 continue
+
             try:
                 self.bot.sendMessage(self.CHANNEL_ID, "sd")
                 logging.info("📤 Sent 'sd' command.")
@@ -913,6 +926,7 @@ class SofiBotManager:
             m = resp.parsed.auto()
             author_id = str(data.get("author", {}).get("id"))
             channel_id = str(data.get("channel_id"))
+            guild_id = str(data.get("guild_id")) if data.get("guild_id") else None
             content = data.get("content", "")
 
             # record our identity when we speak
@@ -928,6 +942,8 @@ class SofiBotManager:
             # Only listen to Sofi bot
             if author_id != SofiBotManager.SOFI_BOT_ID:
                 return
+            if guild_id != self.GUILD_ID:
+                return   # 🔒 Ignore messages not from our server
 
             self.last_message_received = time.time()
 
@@ -969,20 +985,15 @@ class SofiBotManager:
 
     def start(self):
         global READER
-
-        # prevent double-start
-        if self._running:
-            logging.info("Bot already running; start() ignored.")
+        if self.bot_thread and self.bot_thread.is_alive():
+            logging.info("Bot already running.")
             return
-        self._running = True
 
-        # Init OCR (download on first run). Default: CPU (packaging-friendly)
         logging.info(f"Initializing EasyOCR (gpu={self.USE_GPU}) …")
-        READER = easyocr.Reader(["en"], gpu=self.USE_GPU, verbose=False)
-        # warm-up
-        _ = READER.readtext(np.zeros((100, 100, 3), dtype=np.uint8), detail=0)
+        if READER is None:
+            READER = easyocr.Reader(["en"], gpu=self.USE_GPU, verbose=False)
+            _ = READER.readtext(np.zeros((100, 100, 3), dtype=np.uint8), detail=0)
 
-        # Init Discum
         self.bot = discum.Client(token=self.TOKEN, log=False)
         self._install_handlers()
 
@@ -990,19 +1001,22 @@ class SofiBotManager:
         self.pending_claim["user_id"] = self.USER_ID
         self.bot_identity_logged = False
         self.sent_initial_sd = False
+        self._run_token += 1  # new generation
 
         # helper threads
-        self.sd_thread = threading.Thread(target=self.periodic_sd_sender, daemon=True)
-        self.ka_thread = threading.Thread(target=self.keep_alive, daemon=True)
-        self.watchdog_thread = threading.Thread(target=self.message_watchdog, daemon=True)
-        self.claim_timeout_thread = threading.Thread(target=self.reset_claim_if_timed_out, daemon=True)
+        if not (self.sd_thread and self.sd_thread.is_alive()):
+            self.sd_thread = threading.Thread(target=self.periodic_sd_sender, daemon=True)
+            self.sd_thread.start()
+        if not (self.ka_thread and self.ka_thread.is_alive()):
+            self.ka_thread = threading.Thread(target=self.keep_alive, daemon=True)
+            self.ka_thread.start()
+        if not (self.watchdog_thread and self.watchdog_thread.is_alive()):
+            self.watchdog_thread = threading.Thread(target=self.message_watchdog, daemon=True)
+            self.watchdog_thread.start()
+        if not (self.claim_timeout_thread and self.claim_timeout_thread.is_alive()):
+            self.claim_timeout_thread = threading.Thread(target=self.reset_claim_if_timed_out, daemon=True)
+            self.claim_timeout_thread.start()
 
-        self.sd_thread.start()
-        self.ka_thread.start()
-        self.watchdog_thread.start()
-        self.claim_timeout_thread.start()
-
-        # gateway thread
         def run_gateway():
             logging.info("Connecting to Discord gateway …")
             try:
@@ -1014,38 +1028,30 @@ class SofiBotManager:
         self.bot_thread = threading.Thread(target=run_gateway, daemon=True)
         self.bot_thread.start()
 
+
     def stop(self):
-        if not self._running:
-            return
         logging.info("Stopping bot …")
-        self._running = False
-
-        # signal all helpers to exit
         self.stop_event.set()
-
-        # close gateway/client if present
         try:
             if self.bot and self.bot.gateway:
                 self.bot.gateway.close()
         except Exception:
             pass
 
-        # join helpers quickly
-        for attr in ("sd_thread", "ka_thread", "watchdog_thread",
-                     "claim_timeout_thread", "bot_thread"):
-            t = getattr(self, attr, None)
-            try:
-                if t and t.is_alive():
+        # Join helper threads briefly to avoid duplicates on restart
+        for tname in ("sd_thread", "ka_thread", "watchdog_thread", "claim_timeout_thread"):
+            t = getattr(self, tname, None)
+            if t and t.is_alive():
+                try:
                     t.join(timeout=2.0)
-            except Exception:
-                pass
-            setattr(self, attr, None)  # ensure we can't reuse the old ref
-
+                except Exception:
+                    pass
+                setattr(self, tname, None)
         logging.info("Bot stopped.")
 
     # ---- NEW: soft restart (no process restart) ----
     def restart_bot(self):
-        # only one restart at a time
+    # only one restart at a time
         with self._restart_lock:
             if self._restart_in_progress:
                 logging.info("Restart already in progress; skipping.")
@@ -1059,6 +1065,9 @@ class SofiBotManager:
                 self.stop()
             except Exception:
                 pass
+
+            # bump run token so any old loops exit on next check
+            self._run_token += 1
 
             # reset flags/state but keep OCR reader warm
             self.stop_event = threading.Event()
@@ -1075,33 +1084,38 @@ class SofiBotManager:
                 logging.error(f"Failed to re-create Discum client: {e}")
                 return
 
-            # restart helper threads
-            self.sd_thread = threading.Thread(target=self.periodic_sd_sender, daemon=True)
-            self.ka_thread = threading.Thread(target=self.keep_alive, daemon=True)
-            self.watchdog_thread = threading.Thread(target=self.message_watchdog, daemon=True)
-            self.claim_timeout_thread = threading.Thread(target=self.reset_claim_if_timed_out, daemon=True)
+            # (Re)start helper threads — but only if not already alive
+            if not (self.sd_thread and self.sd_thread.is_alive()):
+                self.sd_thread = threading.Thread(target=self.periodic_sd_sender, daemon=True)
+                self.sd_thread.start()
 
-            self.sd_thread.start()
-            self.ka_thread.start()
-            self.watchdog_thread.start()
-            self.claim_timeout_thread.start()
+            if not (self.ka_thread and self.ka_thread.is_alive()):
+                self.ka_thread = threading.Thread(target=self.keep_alive, daemon=True)
+                self.ka_thread.start()
 
-            # restart gateway
+            if not (self.watchdog_thread and self.watchdog_thread.is_alive()):
+                self.watchdog_thread = threading.Thread(target=self.message_watchdog, daemon=True)
+                self.watchdog_thread.start()
+
+            if not (self.claim_timeout_thread and self.claim_timeout_thread.is_alive()):
+                self.claim_timeout_thread = threading.Thread(target=self.reset_claim_if_timed_out, daemon=True)
+                self.claim_timeout_thread.start()
+
+            # (Re)run the gateway
             def run_gateway():
-                logging.info("Reconnecting to Discord gateway …")
+                logging.info("Connecting to Discord gateway …")
                 try:
                     self.bot.gateway.run(auto_reconnect=True)
                 except Exception as e:
-                    logging.critical(f"Failed to reconnect to Discord gateway: {e}")
+                    logging.critical(f"Failed to connect to Discord gateway: {e}")
+                    logging.critical("Check DISCORD_TOKEN, internet, or Discord status.")
 
+            # Create a fresh gateway thread every restart
             self.bot_thread = threading.Thread(target=run_gateway, daemon=True)
             self.bot_thread.start()
 
-            self._running = True
         finally:
-            # release single-flight flag
-            with self._restart_lock:
-                self._restart_in_progress = False
+            self._restart_in_progress = False
 
     # (kept for reference; not used anymore)
     def restart_process(self):
