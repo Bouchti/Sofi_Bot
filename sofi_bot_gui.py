@@ -1,5 +1,14 @@
 # sofi_bot_gui.py
 # -*- coding: utf-8 -*-
+"""
+Sofi Farming Bot (Discum + EasyOCR) with:
+- Strict Elite-card detector (low false positives)
+- Preference-based claiming logic (no_gen, low_gen, high_likes, series_match)
+- Absolute rule: claim any card with generation < 10
+- Tkinter UI with colored logs
+- Watchdog & soft restart (no duplicate sd sends)
+- Guild filtering (ignore messages outside configured server)
+"""
 import os
 import time
 import logging
@@ -22,9 +31,8 @@ from dotenv import load_dotenv
 from rapidfuzz import fuzz
 import easyocr
 import discum
-from discum.utils.button import Buttoner
 
-# --- UI (built-in, free) ---
+# --- UI (built-in) ---
 import tkinter as tk
 from tkinter import ttk, messagebox
 from tkinter.scrolledtext import ScrolledText
@@ -36,18 +44,18 @@ READER = None
 
 # ---- Elite detector config (defaults) ----
 ELITE_PARAMS = {
-    "ring_ratio": 0.045,
-    "edge_margin": 0.05,
-    "sat_min": 45,         # requested defaults
-    "val_min": 60,         # requested defaults
-    "hue_bins": 36,
-    "edge_nonzero_bins_min": 8,
-    "edge_peak_max": 0.55,
-    "edge_cstd_min": 40.0, # requested default
-    "edge_count_min": 120,
+    "ring_ratio": 0.045,        # thickness ratio for edge sampling
+    "edge_margin": 0.05,        # ignore corners
+    "sat_min": 45,              # saturation threshold (0-255)
+    "val_min": 60,              # value/brightness threshold (0-255)
+    "hue_bins": 36,             # bins for hue histogram (0-360 deg)
+    "edge_nonzero_bins_min": 8, # required hue diversity per edge
+    "edge_peak_max": 0.55,      # max single-bin dominance
+    "edge_cstd_min": 40.0,      # min circular std (deg) per edge
+    "edge_count_min": 120,      # min pixels per edge after threshold
     "global_nonzero_bins_min": 12,
     "global_peak_max": 0.60,
-    # keep the algo the same:
+    # cluster checks on ring hues
     "cluster_min_frac": 0.12,
     "cluster_min_sep": 45.0,
 }
@@ -84,23 +92,21 @@ def load_top_characters(json_path: str):
         logging.error(f"Failed to load {json_path}: {e}")
         return [], set()
 
-    for idx, entry in enumerate(data):
+    for entry in data:
         if isinstance(entry, dict):
             if "character" not in entry or "series" not in entry:
                 full_name = entry.get("full_name", "").strip()
-                if full_name:
-                    parts = full_name.split()
-                    if len(parts) >= 2:
-                        entry["character"] = " ".join(parts[:-1])
-                        entry["series"] = parts[-1]
-                    else:
-                        continue
+                if not full_name:
+                    continue
+                parts = full_name.split()
+                if len(parts) >= 2:
+                    entry["character"] = " ".join(parts[:-1])
+                    entry["series"] = parts[-1]
                 else:
                     continue
             if "full_name" not in entry:
                 entry["full_name"] = f"{entry['character']} {entry['series']}"
             cleaned.append(entry)
-        # else skip quietly
     return cleaned, {e["character"].lower() for e in cleaned if "character" in e}
 
 def preprocess_image(image):
@@ -134,14 +140,14 @@ def extract_generation_with_easyocr(image):
                 continue
 
             text_clean = re.sub(r"[^a-zA-Z0-9]", "", original_text)
-            # ONLY substitutions on gen-like strings
+            # substitutions on gen-like strings
             text_clean = (
                 text_clean.replace("i", "1").replace("I", "1")
                 .replace("o", "0").replace("O", "0")
                 .replace("g", "9").replace("s", "5").replace("S", "5")
                 .replace("B", "8").replace("l", "1")
             )
-            if text_clean.startswith(("0", "6", "5", "9")) and not text_clean.upper().startswith("G"):
+            if text_clean and text_clean[0] in ("0", "6", "5", "9") and not text_clean.upper().startswith("G"):
                 text_clean = "G" + text_clean[1:]
 
             match = re.match(r"^G(\d{1,4})$", text_clean.upper())
@@ -179,76 +185,50 @@ def extract_generation_with_easyocr(image):
     name, series = extract_card_name_and_series(extracted_text)
     return generations, name, series
 
-# --- Elite detector: robust rainbow-frame classifier with per-edge gating -----
-
-# ---------- card segmentation (robust & rectangle-friendly) ----------
+# ---------- Elite detector helpers ----------
 def _segment_card_mask(col_bgr):
-    """
-    Segment the single card region inside a column.
-    Returns a binary mask (uint8) covering the FULL card area.
-    """
+    """Segment the single card region inside a column. Returns a filled mask."""
     h, w = col_bgr.shape[:2]
-
-    # 1) gentle denoise (preserve edges), then edge extraction
     gray = cv2.cvtColor(col_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 40, 120)
-
-    # 2) also threshold by brightness to keep card area
-    th = cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 41, -5
-    )
-
-    # combine and clean
+    th = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 41, -5)
     mix = cv2.bitwise_or(th, edges)
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     mix = cv2.morphologyEx(mix, cv2.MORPH_CLOSE, k, iterations=2)
     mix = cv2.morphologyEx(mix, cv2.MORPH_OPEN,  k, iterations=1)
-
     cnts, _ = cv2.findContours(mix, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     mask = np.zeros((h, w), np.uint8)
     if not cnts:
         return mask
-
-    # largest contour → convex hull → fill → one more close
     big = max(cnts, key=cv2.contourArea)
     hull = cv2.convexHull(big)
     cv2.drawContours(mask, [hull], -1, 255, -1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
     return mask
 
-
-# ---------- build thin frame strips from card mask ----------
 def _make_frame_strips(raw_card_mask, bottom_exclude=0.22, inset_ratio=0.012, thick_ratio=0.032):
-    """
-    Creates a thin 'ring' mask hugging the inner border of the card, and
-    returns band rectangles for top/left/right (used for debugging/vis).
-    """
+    """Create thin ring near inner border. Returns (ring_mask, bands_info)."""
     h, w = raw_card_mask.shape[:2]
     ys, xs = np.where(raw_card_mask > 0)
     if xs.size == 0:
         return np.zeros_like(raw_card_mask), {}
-
     x0, x1 = int(xs.min()), int(xs.max())
     y0, y1 = int(ys.min()), int(ys.max())
     cw, ch = (x1 - x0 + 1), (y1 - y0 + 1)
-
     inset = max(2, int(round(min(cw, ch) * inset_ratio)))
     thick = max(2, int(round(min(cw, ch) * thick_ratio)))
     y_cap = y0 + int(round((1.0 - bottom_exclude) * ch))
 
     def clamp(a, lo, hi): return max(lo, min(hi, a))
-
     top = (clamp(x0 + inset, 0, w - 1),
            clamp(y0 + inset, 0, h - 1),
            clamp(x1 - inset - (x0 + inset), 0, w - 1),
            clamp((y0 + inset + thick) - (y0 + inset), 0, h - 1))
-
     left = (clamp(x0 + inset, 0, w - 1),
             clamp(y0 + inset, 0, h - 1),
             clamp((x0 + inset + thick) - (x0 + inset), 0, w - 1),
             clamp((y_cap - inset) - (y0 + inset), 0, h - 1))
-
     right = (clamp(x1 - inset - thick + 1, 0, w - 1),
              clamp(y0 + inset, 0, h - 1),
              clamp(thick, 0, w - 1),
@@ -261,8 +241,6 @@ def _make_frame_strips(raw_card_mask, bottom_exclude=0.22, inset_ratio=0.012, th
             union[y:y + hh, x:x + ww] = 255
     return union, bands_info
 
-
-# ---------- per-edge metrics (strict gate) ----------
 def _edge_metrics(Hdeg, S, V, h, w, side,
                   ring_ratio=ELITE_PARAMS["ring_ratio"],
                   edge_margin=ELITE_PARAMS["edge_margin"],
@@ -271,10 +249,7 @@ def _edge_metrics(Hdeg, S, V, h, w, side,
                   edge_peak_max=ELITE_PARAMS["edge_peak_max"],
                   edge_cstd_min=None,
                   edge_count_min=ELITE_PARAMS["edge_count_min"]):
-    """
-    Measure hue diversity on a single edge. Hdeg is hue in degrees (0..360).
-    Uses ELITE_PARAMS for thresholds unless explicitly overridden.
-    """
+    """Measure hue diversity on a single edge."""
     if sat_min is None: sat_min = ELITE_PARAMS["sat_min"]
     if val_min is None: val_min = ELITE_PARAMS["val_min"]
     if edge_cstd_min is None: edge_cstd_min = ELITE_PARAMS["edge_cstd_min"]
@@ -302,7 +277,6 @@ def _edge_metrics(Hdeg, S, V, h, w, side,
     peak = float(hist.max() / max(1.0, total))
     nonzero = int((hist > 0).sum())
 
-    # circular std (proper formula, in degrees)
     ang = np.deg2rad(hue)
     s, c = np.sin(ang).sum(), np.cos(ang).sum()
     R = np.sqrt(s*s + c*c) / max(1.0, hue.size)
@@ -315,8 +289,6 @@ def _edge_metrics(Hdeg, S, V, h, w, side,
           cstd >= float(edge_cstd_min))
     return dict(ok=ok, nonzero=nonzero, peak=peak, cstd=cstd, n=int(hue.size))
 
-
-# ---------- classifier (edge gate + hue kmeans + Lab confirmation) ----------
 def _classify_ring(card_bgr, ring_mask, bands_info):
     """
     Core ELITE decision:
@@ -333,7 +305,7 @@ def _classify_ring(card_bgr, ring_mask, bands_info):
     S = hsv[..., 1]; V = hsv[..., 2]
     h, w = card_bgr.shape[:2]
 
-    # 1) strict per-edge gate (now using ELITE_PARAMS thresholds)
+    # 1) strict per-edge gate
     mt = _edge_metrics(Hdeg, S, V, h, w, "top")
     mb = _edge_metrics(Hdeg, S, V, h, w, "bottom")
     ml = _edge_metrics(Hdeg, S, V, h, w, "left")
@@ -368,7 +340,7 @@ def _classify_ring(card_bgr, ring_mask, bands_info):
     min_sep = float(min(_angsep(centers_deg[i], centers_deg[j])
                         for i in range(3) for j in range(i+1, 3)))
 
-    # dominant-hue veto (bright solid frames)
+    # dominant-hue veto
     if props[0] >= 0.62 and min_sep < 60.0:
         dbg = {"edges": {"top": mt, "bottom": mb, "left": ml, "right": mr},
                "props": [float(p) for p in props], "min_sep": min_sep, "gate": "dominant_veto"}
@@ -393,7 +365,6 @@ def _classify_ring(card_bgr, ring_mask, bands_info):
     sse3 = float(sse3) if np.isscalar(sse3) else float(np.sum(sse3))
     k_gain = max(0.0, (sse1 - sse3) / (sse1 + 1e-6))
 
-    # final decision
     elite = bool((np.sum(props >= ELITE_PARAMS["cluster_min_frac"]) >= 3) and
                  (min_sep >= ELITE_PARAMS["cluster_min_sep"]) and
                  (hull_norm >= 0.020 or k_gain >= 0.45))
@@ -416,20 +387,16 @@ def _classify_ring(card_bgr, ring_mask, bands_info):
     }
     return elite, float(score), dbg
 
-
 def is_elite_card(card_img_bgr):
     if card_img_bgr is None or card_img_bgr.size == 0:
         return False, {"reason": "empty"}
-
     raw_card_mask = _segment_card_mask(card_img_bgr)
     ring_mask, bands_info = _make_frame_strips(raw_card_mask, bottom_exclude=0.22)
     if ring_mask.sum() == 0:
         return False, {"reason": "no_card"}
-
     elite, score, dbg = _classify_ring(card_img_bgr, ring_mask, bands_info)
     dbg["score"] = round(float(score), 3)
     return elite, dbg
-
 
 def extract_card_for_index(index, card_crop):
     try:
@@ -438,7 +405,6 @@ def extract_card_for_index(index, card_crop):
             rgb = np.array(card_crop)
         else:
             rgb = card_crop
-
         if rgb.ndim == 3 and rgb.shape[2] == 3:
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         else:
@@ -479,42 +445,24 @@ def extract_card_generations(image: Image.Image):
 
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = [executor.submit(extract_card_for_index, i, _crop_card(i)) for i in range(3)]
-
         for fut in futures:
             try:
                 i, (gens, name, series, elite) = fut.result()
-
-                # record if we have any useful signal at all
-                if gens or name or elite:
-                    card_info[i] = {
-                        "generations": gens or {},
-                        "name": name or "",
-                        "series": series or "",
-                        "elite": bool(elite),
-                    }
-                else:
-                    # ensure the key exists with defaults (optional)
-                    card_info[i] = {
-                        "generations": {},
-                        "name": "",
-                        "series": "",
-                        "elite": False,
-                    }
-
+                card_info[i] = {
+                    "generations": gens or {},
+                    "name": name or "",
+                    "series": series or "",
+                    "elite": bool(elite),
+                }
                 logging.info(
                     f"✅ Card {i}: Gen={list((gens or {}).keys()) or '∅'}, "
                     f"Name='{name or ''}', Series='{series or ''}', Elite={elite}"
                 )
-
             except Exception as e:
-                logging.warning(f"⚠️ Failed to extract data for card: {e}")
-                # ensure safe default
-                card_info[len(card_info)] = {
-                    "generations": {},
-                    "name": "",
-                    "series": "",
-                    "elite": False,
-                }
+                logging.warning(f"⚠️ Failed to extract data for a card: {e}")
+                # keep a default entry
+                idx = len(card_info)
+                card_info[idx] = {"generations": {}, "name": "", "series": "", "elite": False}
 
     logging.debug(f"🚀 FINAL CARD INFO: {card_info}")
     return card_info
@@ -525,33 +473,24 @@ def find_best_character_match(name, series, TOP_CHARACTERS_LIST):
     try:
         normalized_name = preprocess_string((name or "").rstrip("-"))
         normalized_series = preprocess_string((series or "").rstrip("-"))
-
         best_entry = None
         best_score = 0
         best_series_score = 0
         best_index = 0
-
         for idx, entry in enumerate(TOP_CHARACTERS_LIST):
             character = preprocess_string((entry.get("character", "") or "").rstrip("...").rstrip("-"))
             series_name = preprocess_string((entry.get("series", "") or "").rstrip("...").rstrip("-"))
 
-            if len(character) <= 4:
-                name_score = fuzz.ratio(normalized_name, character)
-            else:
-                name_score = fuzz.partial_ratio(normalized_name, character)
-
+            name_score = fuzz.partial_ratio(normalized_name, character) if len(character) > 4 \
+                         else fuzz.ratio(normalized_name, character)
             if name_score > 85:
-                if len(series_name) <= 4:
-                    series_score = fuzz.ratio(normalized_series, series_name)
-                else:
-                    series_score = fuzz.partial_ratio(normalized_series, series_name)
-
+                series_score = fuzz.partial_ratio(normalized_series, series_name) if len(series_name) > 4 \
+                               else fuzz.ratio(normalized_series, series_name)
                 if series_score > 85 and name_score + series_score > best_score + best_series_score:
                     best_score = name_score
                     best_series_score = series_score
                     best_entry = entry
                     best_index = idx
-
         if best_entry:
             full_name = best_entry.get("full_name") or f"{best_entry['character']} {best_entry['series']}"
             return best_score, best_index, best_entry.get("likes", 0), full_name, best_entry.get("series")
@@ -570,7 +509,6 @@ class SofiBotManager:
         self.leaderboard_path = leaderboard
 
         # locks & state
-        self.last_drop_id_lock = Lock()
         self.last_processed_time_lock = Lock()
 
         self.pending_claim = {"message_id": None, "timestamp": None, "user_id": None, "triggered": False}
@@ -590,6 +528,11 @@ class SofiBotManager:
         self.bot_identity_logged = False
         self.sent_initial_sd = False  # ensure first sd fires after on_ready
 
+        # lifecycle guards
+        self._restart_in_progress = False
+        self._restart_lock = threading.Lock()
+        self._run_token = 0  # increments on every (re)start
+
         # config defaults
         load_dotenv(self.cfg_path)
         self.TOKEN = os.getenv("DISCORD_TOKEN", "")
@@ -599,28 +542,20 @@ class SofiBotManager:
         self.SD_INTERVAL_SEC = int(os.getenv("SD_INTERVAL_SEC", "480"))
         self.USE_GPU = (os.getenv("OCR_USE_GPU", "0") == "1")
 
-                   # ---- lifecycle guards (avoid duplicate restarts/threads) ----
-        self._running = False                 # single bot instance flag
-        self._restart_in_progress = False     # single-flight restart flag
-        self._restart_lock = threading.Lock() # protects restart section
-        self._run_token = 0  # increments on every (re)start
-
-        # ---- Optional env overrides for elite thresholds
+        # Optional env overrides for elite thresholds
         try:
             ELITE_PARAMS["sat_min"] = int(os.getenv("ELITE_SAT_MIN", str(ELITE_PARAMS["sat_min"])))
             ELITE_PARAMS["val_min"] = int(os.getenv("ELITE_VAL_MIN", str(ELITE_PARAMS["val_min"])))
             ELITE_PARAMS["edge_cstd_min"] = float(os.getenv("ELITE_EDGE_CSTD_MIN", str(ELITE_PARAMS["edge_cstd_min"])))
         except Exception:
-            # keep defaults if parsing fails
             pass
 
         # preferences
         prefs_raw = os.getenv("PREFERENCES", "no_gen,low_gen,high_likes,series_match")
         self.preferences = [p.strip().lower() for p in prefs_raw.split(",") if p.strip()]
         valid_prefs = {"no_gen", "low_gen", "high_likes", "series_match"}
-        self.preferences = [p for p in self.preferences if p in valid_prefs]
-        if not self.preferences:
-            self.preferences = ["no_gen", "low_gen", "high_likes", "series_match"]
+        self.preferences = [p for p in self.preferences if p in valid_prefs] or \
+                           ["no_gen", "low_gen", "high_likes", "series_match"]
         self.series_preference = os.getenv("SERIES_NAME", "").strip()
 
         # leaderboard
@@ -633,7 +568,7 @@ class SofiBotManager:
             elapsed = time.time() - self.last_message_received
             if elapsed > self.WATCHDOG_TIMEOUT:
                 logging.error(f"🛑 No message received for {elapsed:.1f}s. Restarting bot (soft)…")
-                self.restart_bot()   # single-flight guarded
+                self.restart_bot()
                 return
 
     def reset_claim_if_timed_out(self):
@@ -648,23 +583,20 @@ class SofiBotManager:
         run_token = self._run_token  # capture my generation
         # Wait until on_ready sent the first 'sd'
         while not self.stop_event.is_set() and not self.sent_initial_sd:
-            time.sleep(0.2)
+            if self.stop_event.wait(0.2):
+                return
             if run_token != self._run_token:
                 return  # superseded by restart
 
         while not self.stop_event.is_set():
-            # hard floor so we never spam
             base = float(self.SD_INTERVAL_SEC)
             wait_time = max(300.0, base + random.uniform(0, 10))
-
             logging.info(f"⏳ Waiting {wait_time:.1f}s before sending next 'sd'…")
-            # Use wait() so we can be interrupted by stop_event
             if self.stop_event.wait(wait_time):
                 break
             if run_token != self._run_token:
                 return  # superseded by restart
 
-            # double check gateway is alive
             if not self.bot or not getattr(self.bot.gateway, "session_id", None):
                 logging.warning("⚠️ Gateway session missing. Skipping 'sd'.")
                 continue
@@ -679,7 +611,8 @@ class SofiBotManager:
         previous_latency = None
         failure_count = 0
         while not self.stop_event.is_set():
-            time.sleep(30)
+            if self.stop_event.wait(30):
+                break
             try:
                 latency = self.bot.gateway.latency if self.bot else None
                 if latency is None or latency == previous_latency:
@@ -723,12 +656,12 @@ class SofiBotManager:
 
         card_info = extract_card_generations(pil_image)
 
-        # ---- If any elite exists, click it NOW (fast), then log likes for all cards
+        # Elite immediate claim
         elite_choice = next((i for i in range(card_count) if card_info.get(i, {}).get("elite")), None)
         if elite_choice is not None:
             self.click_discord_button(button_ids[elite_choice], channel_id, guild_id, m)
             logging.info(f"✅ Claimed card {elite_choice+1} (🌈 ELITE 🌈)")
-            # Print likes/info for all cards (non-blocking for the click)
+            # log info for all
             for i in range(card_count):
                 info = card_info.get(i, {})
                 gens = info.get("generations", {}) or {}
@@ -745,18 +678,16 @@ class SofiBotManager:
                 )
             return
 
-        # ----- Build per-card metadata once (and log likes/info)
+        # Build per-card data & log
         cards = []
         for i in range(card_count):
             info = card_info.get(i, {})
             gens = info.get("generations", {}) or {}
             name = info.get("name") or ""
             series = info.get("series") or ""
-
             match_score, match_idx, likes, matched_name, matched_series = find_best_character_match(
                 name, series, self.TOP_CHARACTERS_LIST
             )
-
             cards.append({
                 "index": i,
                 "gens": gens,
@@ -770,7 +701,6 @@ class SofiBotManager:
                 "likes": likes or 0,
             })
 
-        # Print a clean summary line for each card with likes
         for c in cards:
             disp_name = c["matched_name"] or c["name"] or "(unknown)"
             disp_series = c["matched_series"] or c["series"] or ""
@@ -779,13 +709,12 @@ class SofiBotManager:
                 f"| name='{disp_name}' | series='{disp_series}' | match={c['match_score']}%"
             )
 
-        # 🚨 Absolute rule: if any card has generation < 10, choose it now (ignore preferences)
+        # Absolute rule: any gen < 10
         low_gen_candidates = [c for c in cards if c["min_gen"] is not None and c["min_gen"] < 10]
         if low_gen_candidates:
             low_gen_candidates.sort(key=lambda c: (c["min_gen"], -c["likes"], c["index"]))
             chosen = low_gen_candidates[0]
             chosen_index = chosen["index"]
-
             now = time.time()
             if chosen.get("gens", {}):
                 with self.last_processed_time_lock:
@@ -797,17 +726,15 @@ class SofiBotManager:
                         elif cooldown_active:
                             logging.info("Skipping claim — cooldown not expired.")
                         return
-
             self.click_discord_button(button_ids[chosen_index], channel_id, guild_id, m)
             self.pending_claim["timestamp"] = now
             self.pending_claim["triggered"] = True
             self.pending_claim["user_id"] = self.USER_ID
-
             elapsed_time = time.time() - image_received_time
             logging.info(f"✅ Claimed card {chosen_index+1} (⚡ generation < 10: G{chosen['min_gen']} ⚡) in {elapsed_time:.2f}s")
             return
 
-        # ---- Apply preferences as before
+        # Preferences
         def filter_by_pref(candidates, pref):
             if pref == "no_gen":
                 kept = [c for c in candidates if not c["has_gen"]]
@@ -856,7 +783,6 @@ class SofiBotManager:
         chosen_index = chosen["index"]
         now = time.time()
         generations = chosen.get("gens", {})
-
         if generations:
             with self.last_processed_time_lock:
                 cooldown_active = self.last_processed_time and (now - self.last_processed_time < self.PROCESS_COOLDOWN_SECONDS)
@@ -873,9 +799,7 @@ class SofiBotManager:
         self.pending_claim["triggered"] = True
         self.pending_claim["user_id"] = self.USER_ID
 
-        card_claimed_time = time.time()
-        elapsed_time = card_claimed_time - image_received_time
-
+        elapsed_time = time.time() - image_received_time
         tag = ""
         if not chosen["has_gen"]:
             tag = "no generation"
@@ -888,7 +812,6 @@ class SofiBotManager:
             or self.series_preference.lower() in (chosen["series"] or "").lower()
         ):
             tag = f"{tag} / series match".strip(" /")
-
         logging.info(f"✅ Claimed card {chosen_index+1} ({tag or 'preference match'}) in {elapsed_time:.2f}s")
 
     # --------- Bot lifecycle ---------
@@ -903,9 +826,9 @@ class SofiBotManager:
             else:
                 logging.info("Connected (user info missing).")
 
-            # 🔥 Initial 'sd' right after gateway is ready (only once)
+            # Initial 'sd' right after gateway is ready (only once)
             if not self.sent_initial_sd:
-                for attempt in range(1, 6):
+                for _ in range(6):
                     try:
                         if self.bot and self.bot.gateway.session_id:
                             self.bot.sendMessage(self.CHANNEL_ID, "sd")
@@ -939,11 +862,11 @@ class SofiBotManager:
                     pass
                 self.bot_identity_logged = True
 
-            # Only listen to Sofi bot
+            # Only Sofi bot & only our guild
             if author_id != SofiBotManager.SOFI_BOT_ID:
                 return
-            if guild_id != self.GUILD_ID:
-                return   # 🔒 Ignore messages not from our server
+            if self.GUILD_ID and guild_id != self.GUILD_ID:
+                return   # ignore other servers
 
             self.last_message_received = time.time()
 
@@ -1028,7 +951,6 @@ class SofiBotManager:
         self.bot_thread = threading.Thread(target=run_gateway, daemon=True)
         self.bot_thread.start()
 
-
     def stop(self):
         logging.info("Stopping bot …")
         self.stop_event.set()
@@ -1037,7 +959,6 @@ class SofiBotManager:
                 self.bot.gateway.close()
         except Exception:
             pass
-
         # Join helper threads briefly to avoid duplicates on restart
         for tname in ("sd_thread", "ka_thread", "watchdog_thread", "claim_timeout_thread"):
             t = getattr(self, tname, None)
@@ -1049,9 +970,8 @@ class SofiBotManager:
                 setattr(self, tname, None)
         logging.info("Bot stopped.")
 
-    # ---- NEW: soft restart (no process restart) ----
     def restart_bot(self):
-    # only one restart at a time
+        # single-flight guard
         with self._restart_lock:
             if self._restart_in_progress:
                 logging.info("Restart already in progress; skipping.")
@@ -1060,13 +980,12 @@ class SofiBotManager:
 
         logging.info("🔄 Soft-restarting bot …")
         try:
-            # stop current instance (if any)
             try:
                 self.stop()
             except Exception:
                 pass
 
-            # bump run token so any old loops exit on next check
+            # bump run token so old loops abort
             self._run_token += 1
 
             # reset flags/state but keep OCR reader warm
@@ -1084,24 +1003,20 @@ class SofiBotManager:
                 logging.error(f"Failed to re-create Discum client: {e}")
                 return
 
-            # (Re)start helper threads — but only if not already alive
+            # restart helper threads if needed
             if not (self.sd_thread and self.sd_thread.is_alive()):
                 self.sd_thread = threading.Thread(target=self.periodic_sd_sender, daemon=True)
                 self.sd_thread.start()
-
             if not (self.ka_thread and self.ka_thread.is_alive()):
                 self.ka_thread = threading.Thread(target=self.keep_alive, daemon=True)
                 self.ka_thread.start()
-
             if not (self.watchdog_thread and self.watchdog_thread.is_alive()):
                 self.watchdog_thread = threading.Thread(target=self.message_watchdog, daemon=True)
                 self.watchdog_thread.start()
-
             if not (self.claim_timeout_thread and self.claim_timeout_thread.is_alive()):
                 self.claim_timeout_thread = threading.Thread(target=self.reset_claim_if_timed_out, daemon=True)
                 self.claim_timeout_thread.start()
 
-            # (Re)run the gateway
             def run_gateway():
                 logging.info("Connecting to Discord gateway …")
                 try:
@@ -1110,18 +1025,11 @@ class SofiBotManager:
                     logging.critical(f"Failed to connect to Discord gateway: {e}")
                     logging.critical("Check DISCORD_TOKEN, internet, or Discord status.")
 
-            # Create a fresh gateway thread every restart
             self.bot_thread = threading.Thread(target=run_gateway, daemon=True)
             self.bot_thread.start()
 
         finally:
             self._restart_in_progress = False
-
-    # (kept for reference; not used anymore)
-    def restart_process(self):
-        self.stop()
-        time.sleep(1)
-        os.execv(sys.executable, [sys.executable] + sys.argv)
 
     def save_env(self):
         data = {
@@ -1156,7 +1064,6 @@ class TextHandler(logging.Handler):
     def emit(self, record):
         msg = self.format(record) + "\n"
         level = record.levelno
-        # choose tag by level
         if level >= logging.CRITICAL:
             tag = "CRITICAL"
         elif level >= logging.ERROR:
@@ -1167,8 +1074,6 @@ class TextHandler(logging.Handler):
             tag = "INFO"
         else:
             tag = "DEBUG"
-
-        # UI updates must be scheduled on the main thread
         try:
             self.widget.after(0, self._append_with_tag, msg, tag)
         except Exception:
@@ -1202,7 +1107,6 @@ class SofiApp(tk.Tk):
         signal.signal(signal.SIGTERM, self._signal_handler)
         self._start()
         self._tick_status()
- 
 
     def _build_ui(self):
         pad = {"padx": 8, "pady": 6}
@@ -1305,10 +1209,10 @@ class SofiApp(tk.Tk):
         self.txt_log = ScrolledText(frm_log, height=24, state="disabled")
         self.txt_log.pack(fill="both", expand=True, padx=6, pady=6)
 
-        self.txt_log.tag_config("DEBUG",    foreground="#6b7280")
-        self.txt_log.tag_config("INFO",     foreground="#2563eb")
-        self.txt_log.tag_config("WARNING",  foreground="#d97706")
-        self.txt_log.tag_config("ERROR",    foreground="#dc2626")
+        self.txt_log.tag_config("DEBUG",    foreground="#6b7280")  # slate-500
+        self.txt_log.tag_config("INFO",     foreground="#2563eb")  # blue-600
+        self.txt_log.tag_config("WARNING",  foreground="#d97706")  # amber-600
+        self.txt_log.tag_config("ERROR",    foreground="#dc2626")  # red-600
         self.txt_log.tag_config("CRITICAL", foreground="#ffffff", background="#b91c1c")
         self.txt_log.tag_config("CRITICAL", font=("TkDefaultFont", 9, "bold"))
 
@@ -1338,8 +1242,6 @@ class SofiApp(tk.Tk):
         self.var_user.set(m.USER_ID)
         self.var_interval.set(m.SD_INTERVAL_SEC)
         self.var_gpu.set(bool(m.USE_GPU))
-
-        # preferences
         prefs = (m.preferences + ["", "", "", ""])[:4]
         self.var_pref1.set(prefs[0] or "no_gen")
         self.var_pref2.set(prefs[1] or "low_gen")
@@ -1351,7 +1253,6 @@ class SofiApp(tk.Tk):
         self.ent_token.configure(show="" if self.show_token.get() else "•")
 
     def _start(self):
-        # push UI values into manager
         m = self.manager
         m.TOKEN = self.var_token.get().strip()
         m.GUILD_ID = self.var_guild.get().strip()
@@ -1360,7 +1261,6 @@ class SofiApp(tk.Tk):
         m.SD_INTERVAL_SEC = int(self.var_interval.get())
         m.USE_GPU = bool(self.var_gpu.get())
 
-        # preferences from UI, keep order & unique
         prefs = [self.var_pref1.get(), self.var_pref2.get(), self.var_pref3.get(), self.var_pref4.get()]
         seen = set()
         m.preferences = []
@@ -1379,10 +1279,9 @@ class SofiApp(tk.Tk):
         self.btn_stop.configure(state="normal")
         self.lbl_status.configure(text="Status: Running", foreground="#16a34a")
 
-        # start bot
         try:
             m.start()
-        except Exception as e:
+        except Exception:
             logging.exception("Failed to start bot")
             self._stop()
 
@@ -1404,7 +1303,6 @@ class SofiApp(tk.Tk):
         m.SD_INTERVAL_SEC = int(self.var_interval.get())
         m.USE_GPU = bool(self.var_gpu.get())
 
-        # preferences from UI
         prefs = [self.var_pref1.get(), self.var_pref2.get(), self.var_pref3.get(), self.var_pref4.get()]
         seen = set()
         m.preferences = []
@@ -1433,14 +1331,13 @@ class SofiApp(tk.Tk):
         self.destroy()
 
     def _tick_status(self):
-        # live heartbeat
         if self.manager and self.btn_stop["state"] == "normal":
             since = time.time() - self.manager.last_message_received
             self.lbl_status.configure(text=f"Status: Running — Last Sofi msg {int(since)}s ago")
         self.after(1000, self._tick_status)
 
 if __name__ == "__main__":
-    import argparse, time
+    import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--headless", action="store_true", help="Run without Tkinter UI")
     args = p.parse_args()
