@@ -609,16 +609,30 @@ class SofiBotManager:
             return False
 
         # Parse claim buttons; ignore URL buttons; ignore beyond first 3.
+                # Parse claim buttons; ignore URL buttons; ignore beyond first 3.
         pos_buttons = []
         for row in buttons_components:
             for btn in row.get("components", []):
                 if btn.get("type") != 2 or not btn.get("custom_id"):
                     continue
                 label = str(btn.get("label") or "")
-                mlikes = re.search(r"(\d+)", label.replace(",", ""))
-                likes = int(mlikes.group(1)) if mlikes else None  # None -> acorn/event button
+
+                # --- NEW robust likes parser: supports 1.9K, 2K, 2,345, 3M, etc. ---
+                def _parse_likes(s: str):
+                    s = (s or "").strip().replace(",", "")
+                    m = re.search(r"([\d]+(?:\.\d+)?)\s*([kK]?)", s)
+                    if not m:
+                        return None  # acorn / event buttons have no number
+                    val = float(m.group(1))
+                    suf = m.group(2).lower()
+                    if suf == "k":
+                        val *= 1000.0
+                    return int(round(val))
+                # ---------------------------------------------------------------
+                likes = _parse_likes(label)
                 pos_buttons.append({"id": btn["custom_id"], "likes": likes, "label": label})
         pos_buttons = pos_buttons[:3]
+
 
         if not pos_buttons:
             logging.warning("No claimable buttons found (ignoring link buttons). Abort."); return
@@ -637,7 +651,7 @@ class SofiBotManager:
                     self.click_discord_button(pos_buttons[pos]["id"], channel_id, guild_id, m)
                     logging.info(f"🌰 Claimed acorn at position {pos+1} (#{idx}).")
                     acorn_clicked = True
-                    time.sleep(0.25)
+                    time.sleep(2)
                 except Exception as e:
                     logging.warning(f"Acorn click failed at pos {pos+1}: {e}")
 
