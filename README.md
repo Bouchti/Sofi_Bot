@@ -9,10 +9,6 @@
 Sofi_Bot is an advanced automation bot designed for the Sofi Discord Bot, a popular card-collecting game.
 It detects card drops, analyzes images, and automatically claims the best cards using optimized logic.
 
-Choose between:
-
-⚡ CLI Mode – lightweight console-based automation
-
 🖥️ GUI Mode – user-friendly interface with start/stop buttons, logs, and settings
 
 ---
@@ -80,16 +76,14 @@ USER_ID=your_user_id                # Optional (for logs)
 
 ### 4️⃣ Run the Bot
 
-CLI Mode (Lightweight)
-python farmV3.py
-
 GUI Mode (User-Friendly)
-python sofi_bot_gui.py
+python sofi_bot_gui_V2.py
 
 ⚠️ Disclaimer
 This bot interacts with Discord’s internal API. Use responsibly.
 You must not use this bot to spam, exploit, or violate Discord’s Terms of Service.
 
 Use at your own risk.
+
 
 
