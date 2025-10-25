@@ -510,7 +510,7 @@ class SofiBotManager:
         run_token = self._run_token
         while not self.stop_event.is_set():
             base = float(self.SD_INTERVAL_SEC)
-            wait_time = max(300.0, base + random.uniform(0, 10))
+            wait_time = max(300.0, base + random.uniform(2, 12))
             logging.info(f"⏳ Waiting {wait_time:.1f}s before sending next 'sd'…")
             if self.stop_event.wait(wait_time): break
             if run_token != self._run_token: return
@@ -651,7 +651,7 @@ class SofiBotManager:
                     self.click_discord_button(pos_buttons[pos]["id"], channel_id, guild_id, m)
                     logging.info(f"🌰 Claimed acorn at position {pos+1} (#{idx}).")
                     acorn_clicked = True
-                    time.sleep(2)
+                    time.sleep(3)
                 except Exception as e:
                     logging.warning(f"Acorn click failed at pos {pos+1}: {e}")
 
@@ -891,8 +891,8 @@ class SofiBotManager:
 
             if author_id != SofiBotManager.SOFI_BOT_ID:
                 return
-            if self.GUILD_ID and guild_id != self.GUILD_ID:
-                return
+            #if self.GUILD_ID and guild_id != self.GUILD_ID:
+             #   return
 
             # Confirmation detection (either "grabbed" or "fought off")
             if self.pending_claim.get("triggered"):
