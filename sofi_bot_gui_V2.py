@@ -1,555 +1,863 @@
-# sofi_bot_gui.py
 # -*- coding: utf-8 -*-
 """
-Sofi Farming Bot (Discum + EasyOCR)
-
-UI:
-- Auto-start (no Start button).
-- Change Mode: smart / normal.
-- Normal priorities P1→P3: high_likes / low_gen / no_gen / series.
-- Series preference (optional).
-- Apply (live), Save .env, Stop, Clear Logs, Copy Logs.
-- No manual reboot button (auto-reboots only when needed).
-
-Bot:
-- Auto-reboot (stop -> start) when:
-  • gateway not READY at 'sd' send time
-  • gateway never reaches READY after connect
-  • gateway appears frozen (no events / latency stuck)
-- Claim order:
-  1) Claim all Acorns (buttons without like number)
-  2) ELITE fast-path
-  3) GEN < 10 fast-path
-  4) Smart / Normal picker (ignore 4th button)
-- Smart scoring: adaptive likes vs gen weighting (low gen = higher score).
-- Normal priorities: P1 → P2 → P3 among (high_likes, low_gen, no_gen, series).
+Sofi Farming Bot — GUI + Top.gg voter (Chrome profile reuse)
 
 DISCLAIMER: Using self-bots violates Discord ToS. You assume all risk.
 """
 
-import os
-import time
-import logging
-import threading
-import signal
-import sys
-import random
-import re
+import os, re, sys, time, random, threading, signal, logging, tempfile, shutil
 from io import BytesIO
-from threading import Lock
+from typing import Optional, List, Dict
 from concurrent.futures import ThreadPoolExecutor
+
+# ---------------- lib deps ----------------
+import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-
-# --- Networking / OCR / Discord libs ---
-import requests
 import numpy as np
 from PIL import Image
 import cv2
-from dotenv import load_dotenv
 import easyocr
 import discum
+from dotenv import load_dotenv
 
-# --- UI (built-in) ---
+# UI
 import tkinter as tk
 from tkinter import ttk, messagebox
 from tkinter.scrolledtext import ScrolledText
+# Theming (ttkthemes)
+try:
+    from ttkthemes import ThemedTk
+    HAVE_TTKTHEMES = True
+except Exception:
+    HAVE_TTKTHEMES = False
 
-# --------------------------
-# Global OCR reader handle
-# --------------------------
-READER = None
+# Selenium (Top.gg voting)
+HAVE_SELENIUM = True
+try:
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    import chromedriver_autoinstaller
+except Exception:
+    HAVE_SELENIUM = False
 
-# ---- Elite detector config (lean defaults) ----
-ELITE_PARAMS = {
-    "ring_ratio": 0.045,
-    "edge_margin": 0.05,
-    "sat_min": 45,
-    "val_min": 60,
-    "hue_bins": 36,
-    "edge_nonzero_bins_min": 8,
-    "edge_peak_max": 0.55,
-    "edge_cstd_min": 40.0,
-    "edge_count_min": 120,
-}
-
-# --------------------------
-# Logging setup
-# --------------------------
-LOG_FILE_NAME = "Sofi_bot.log"
+# ---------------- logging ----------------
+LOG_FILE = "Sofi_bot.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.FileHandler(LOG_FILE_NAME, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler(sys.stdout)],
 )
 logging.getLogger("websocket").setLevel(logging.CRITICAL)
 logging.getLogger("discum.gateway.gateway").setLevel(logging.ERROR)
 
-# --------------------------
-# Utilities
-# --------------------------
-def _create_http_session() -> requests.Session:
+# ---------------- HTTP ----------------
+def http_session() -> requests.Session:
     retry = Retry(
-        total=5,
-        connect=5,
-        read=3,
+        total=5, connect=5, read=3,
         backoff_factor=0.5,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=False,
         raise_on_status=False,
         respect_retry_after_header=True,
     )
-    sess = requests.Session()
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=16)
-    sess.mount("https://", adapter)
-    sess.mount("http://", adapter)
-    sess.headers.update({"User-Agent": "SofiBot/1.0 (+requests)"})
-    return sess
+    s = requests.Session()
+    s.mount("https://", HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=16))
+    s.mount("http://",  HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=16))
+    s.headers.update({"User-Agent": "SofiBot/2.0 (+requests)"})
+    return s
 
-def pil_from_url_or_none(session: requests.Session, url: str, timeout: float = 15.0):
+def pil_from_url(s: requests.Session, url: str, timeout=15.0) -> Optional[Image.Image]:
     try:
-        r = session.get(url, timeout=timeout)
+        r = s.get(url, timeout=timeout)
         r.raise_for_status()
         return Image.open(BytesIO(r.content)).convert("RGB")
     except Exception as e:
         logging.warning(f"Image fetch failed: {e}")
         return None
 
-def preprocess_image(image):
-    if isinstance(image, Image.Image):
-        image = np.array(image)
-    if len(image.shape) == 3:
-        image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    return image
+# ---------------- OCR (global) ----------------
+READER = None
+# ---------- Elite detector (copied from sofi_bot_gui) ----------
+ELITE_CFG = dict(
+    ring_ratio=0.045,
+    edge_margin=0.05,
+    sat_min=45,
+    val_min=60,
+    hue_bins=36,
+    edge_nonzero_bins_min=8,
+    edge_peak_max=0.55,
+    edge_cstd_min=40.0,
+    edge_count_min=120,
+)
 
-def extract_generation_with_easyocr(image):
-    """Return (generations_dict, name, series)."""
-    global READER
-    if READER is None:
-        raise RuntimeError("OCR READER is not initialized")
-
-    def clean_generation_text(ocr_results):
-        cleaned_generations = {}
-        for text in ocr_results:
-            if len(cleaned_generations) >= 3:
-                break
-            original_text = (text or "").strip()
-            if not original_text:
-                continue
-            text_upper = (original_text or "").upper()
-
-            # Example: 6G123 -> G123
-            match_6g = re.match(r"^6G(\d{1,4})$", text_upper)
-            if match_6g:
-                gen_number = f"G{match_6g.group(1)}"
-                cleaned_generations[gen_number] = int(match_6g.group(1))
-                continue
-
-            text_clean = re.sub(r"[^a-zA-Z0-9]", "", original_text)
-            # common OCR substitutions
-            text_clean = (
-                text_clean.replace("i", "1").replace("I", "1")
-                .replace("o", "0").replace("O", "0")
-                .replace("g", "9").replace("s", "5").replace("S", "5")
-                .replace("B", "8").replace("l", "1")
-            )
-            if text_clean and text_clean[0] in ("0", "6", "5", "9") and not text_clean.upper().startswith("G"):
-                text_clean = "G" + text_clean[1:]
-
-            match = re.match(r"^G(\d{1,4})$", text_clean.upper())
-            if match:
-                gen_number = f"G{match.group(1)}"
-                cleaned_generations[gen_number] = int(match.group(1))
-        return cleaned_generations
-
-    def extract_card_name_and_series(ocr_results):
-        if not ocr_results or len(ocr_results) < 2:
-            return None, None
-        gen_index = -1
-        for i, text in enumerate(ocr_results):
-            if clean_generation_text([text]):
-                gen_index = i
-                break
-        if gen_index == -1 or gen_index + 1 >= len(ocr_results):
-            return None, None
-        name = (ocr_results[gen_index + 1] or "").strip()
-        series = (ocr_results[gen_index + 2] or "").strip() if gen_index + 2 < len(ocr_results) else None
-        return name, series
-
-    if isinstance(image, Image.Image):
-        image = np.array(image)
-
-    target_width = 300
-    scale_ratio = target_width / image.shape[1]
-    image = cv2.resize(image, (target_width, int(image.shape[0] * scale_ratio)), interpolation=cv2.INTER_AREA)
-
-    if len(image.shape) == 2 or image.shape[2] == 1:
-        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-
-    extracted_text = READER.readtext(image, detail=0, batch_size=2)
-    generations = clean_generation_text(extracted_text)
-    name, series = extract_card_name_and_series(extracted_text)
-    return generations, name, series
-
-# ---------- Elite detector (lean implementation) ----------
-def _segment_card_mask(col_bgr):
-    h, w = col_bgr.shape[:2]
-    gray = cv2.cvtColor(col_bgr, cv2.COLOR_BGR2GRAY)
+def _segment_card_mask(bgr):
+    h, w = bgr.shape[:2]
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 40, 120)
-    th = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 41, -5)
+    th = cv2.adaptiveThreshold(
+        blur,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        41,
+        -5,
+    )
     mix = cv2.bitwise_or(th, edges)
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     mix = cv2.morphologyEx(mix, cv2.MORPH_CLOSE, k, iterations=2)
-    mix = cv2.morphologyEx(mix, cv2.MORPH_OPEN,  k, iterations=1)
+    mix = cv2.morphologyEx(mix, cv2.MORPH_OPEN, k, iterations=1)
     cnts, _ = cv2.findContours(mix, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     mask = np.zeros((h, w), np.uint8)
     if not cnts:
         return mask
-    big = max(cnts, key=cv2.contourArea)
-    hull = cv2.convexHull(big)
+    hull = cv2.convexHull(max(cnts, key=cv2.contourArea))
     cv2.drawContours(mask, [hull], -1, 255, -1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
     return mask
 
-def _make_frame_strips(raw_card_mask, bottom_exclude=0.22, inset_ratio=0.012, thick_ratio=0.032):
-    h, w = raw_card_mask.shape[:2]
-    ys, xs = np.where(raw_card_mask > 0)
+def _make_frame_strips(raw, bottom_exclude=0.22, inset_ratio=0.012, thick_ratio=0.032):
+    h, w = raw.shape[:2]
+    ys, xs = np.where(raw > 0)
     if xs.size == 0:
-        return np.zeros_like(raw_card_mask), {}
+        return np.zeros_like(raw), {}
     x0, x1 = int(xs.min()), int(xs.max())
     y0, y1 = int(ys.min()), int(ys.max())
     cw, ch = (x1 - x0 + 1), (y1 - y0 + 1)
     inset = max(2, int(round(min(cw, ch) * inset_ratio)))
     thick = max(2, int(round(min(cw, ch) * thick_ratio)))
-    y_cap = y0 + int(round((1.0 - bottom_exclude) * ch))
+    ycap = y0 + int(round((1.0 - bottom_exclude) * ch))
 
-    def clamp(a, lo, hi): return max(lo, min(hi, a))
-    top = (clamp(x0 + inset, 0, w - 1),
-           clamp(y0 + inset, 0, h - 1),
-           clamp(x1 - inset - (x0 + inset), 0, w - 1),
-           clamp((y0 + inset + thick) - (y0 + inset), 0, h - 1))
-    left = (clamp(x0 + inset, 0, w - 1),
-            clamp(y0 + inset, 0, h - 1),
-            clamp((x0 + inset + thick) - (x0 + inset), 0, w - 1),
-            clamp((y_cap - inset) - (y0 + inset), 0, h - 1))
-    right = (clamp(x1 - inset - thick + 1, 0, w - 1),
-             clamp(y0 + inset, 0, h - 1),
-             clamp(thick, 0, w - 1),
-             clamp((y_cap - inset) - (y0 + inset), 0, h - 1))
+    def clamp(a, lo, hi):
+        return max(lo, min(hi, a))
 
-    union = np.zeros_like(raw_card_mask, np.uint8)
-    bands_info = {"top": top, "left": left, "right": right}
+    top = (
+        clamp(x0 + inset, 0, w - 1),
+        clamp(y0 + inset, 0, h - 1),
+        clamp(x1 - inset - (x0 + inset), 0, w - 1),
+        clamp((y0 + inset + thick) - (y0 + inset), 0, h - 1),
+    )
+    left = (
+        clamp(x0 + inset, 0, w - 1),
+        clamp(y0 + inset, 0, h - 1),
+        clamp((x0 + inset + thick) - (x0 + inset), 0, w - 1),
+        clamp((ycap - inset) - (y0 + inset), 0, h - 1),
+    )
+    right = (
+        clamp(x1 - inset - thick + 1, 0, w - 1),
+        clamp(y0 + inset, 0, h - 1),
+        clamp(thick, 0, w - 1),
+        clamp((ycap - inset) - (y0 + inset), 0, h - 1),
+    )
+    union = np.zeros_like(raw, np.uint8)
     for (x, y, ww, hh) in (top, left, right):
         if ww > 1 and hh > 1:
-            union[y:y + hh, x:x + ww] = 255
-    return union, bands_info
+            union[y : y + hh, x : x + ww] = 255
+    return union, {"top": top, "left": left, "right": right}
 
-def _edge_metrics(Hdeg, S, V, h, w, side,
-                  ring_ratio=ELITE_PARAMS["ring_ratio"],
-                  edge_margin=ELITE_PARAMS["edge_margin"],
-                  sat_min=None, val_min=None, hue_bins=ELITE_PARAMS["hue_bins"],
-                  edge_nonzero_bins_min=ELITE_PARAMS["edge_nonzero_bins_min"],
-                  edge_peak_max=ELITE_PARAMS["edge_peak_max"],
-                  edge_cstd_min=None,
-                  edge_count_min=ELITE_PARAMS["edge_count_min"]):
-    if sat_min is None: sat_min = ELITE_PARAMS["sat_min"]
-    if val_min is None: val_min = ELITE_PARAMS["val_min"]
-    if edge_cstd_min is None: edge_cstd_min = ELITE_PARAMS["edge_cstd_min"]
+def _edge_metrics(Hdeg, S, V, h, w, side, cfg):
+    thick_x = max(2, int(w * cfg["ring_ratio"]))
+    thick_y = max(2, int(h * cfg["ring_ratio"]))
+    mx = max(1, int(w * cfg["edge_margin"]))
+    my = max(1, int(h * cfg["edge_margin"]))
 
-    thick_x = max(2, int(w * ring_ratio))
-    thick_y = max(2, int(h * ring_ratio))
-    mx = max(1, int(w * edge_margin))
-    my = max(1, int(h * edge_margin))
     if side == "top":
         rr, cc = slice(0, thick_y), slice(mx, w - mx)
-    elif side == "bottom":
+    elif side == "bot":
         rr, cc = slice(h - thick_y, h), slice(mx, w - mx)
     elif side == "left":
         rr, cc = slice(my, h - my), slice(0, thick_x)
     else:
         rr, cc = slice(my, h - my), slice(w - thick_x, w)
 
-    m = (S[rr, cc] >= sat_min) & (V[rr, cc] >= val_min)
+    m = (S[rr, cc] >= cfg["sat_min"]) & (V[rr, cc] >= cfg["val_min"])
     hue = Hdeg[rr, cc][m].astype(np.float32)
     if hue.size == 0:
         return dict(ok=False, nonzero=0, peak=1.0, cstd=0.0, n=0)
 
-    hist, _ = np.histogram(hue, bins=hue_bins, range=(0, 360))
+    hist, _ = np.histogram(hue, bins=cfg["hue_bins"], range=(0, 360))
     total = float(hist.sum())
     peak = float(hist.max() / max(1.0, total))
     nonzero = int((hist > 0).sum())
 
     ang = np.deg2rad(hue)
     s, c = np.sin(ang).sum(), np.cos(ang).sum()
-    R = np.sqrt(s*s + c*c) / max(1.0, hue.size)
+    R = np.sqrt(s * s + c * c) / max(1.0, hue.size)
     R = float(np.clip(R, 1e-6, 0.999999))
     cstd = float(np.degrees(np.sqrt(-2.0 * np.log(R))))
 
-    ok = (hue.size >= edge_count_min and
-          nonzero >= edge_nonzero_bins_min and
-          peak <= edge_peak_max and
-          cstd >= float(edge_cstd_min))
+    ok = (
+        hue.size >= cfg["edge_count_min"]
+        and nonzero >= cfg["edge_nonzero_bins_min"]
+        and peak <= cfg["edge_peak_max"]
+        and cstd >= cfg["edge_cstd_min"]
+    )
     return dict(ok=ok, nonzero=nonzero, peak=peak, cstd=cstd, n=int(hue.size))
 
-def _classify_ring(card_bgr, ring_mask, bands_info):
-    if ring_mask.sum() < 200:
-        return False, 0.0, {"reason": "no_ring"}
-    hsv = cv2.cvtColor(card_bgr, cv2.COLOR_BGR2HSV)
+def is_elite(bgr):
+    """Return True if the card frame looks like an elite (colored ring) card."""
+    if bgr is None or bgr.size == 0:
+        return False
+
+    raw = _segment_card_mask(bgr)
+    ring, _ = _make_frame_strips(raw, bottom_exclude=0.22)
+    if ring.sum() == 0:
+        return False
+
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     Hdeg = hsv[..., 0].astype(np.float32) * 2.0
-    S = hsv[..., 1]; V = hsv[..., 2]
-    h, w = card_bgr.shape[:2]
+    S = hsv[..., 1]
+    V = hsv[..., 2]
 
-    mt = _edge_metrics(Hdeg, S, V, h, w, "top")
-    mb = _edge_metrics(Hdeg, S, V, h, w, "bottom")
-    ml = _edge_metrics(Hdeg, S, V, h, w, "left")
-    mr = _edge_metrics(Hdeg, S, V, h, w, "right")
+    h, w = bgr.shape[:2]
+    mtop = _edge_metrics(Hdeg, S, V, h, w, "top", ELITE_CFG)
+    mbot = _edge_metrics(Hdeg, S, V, h, w, "bot", ELITE_CFG)
+    mlef = _edge_metrics(Hdeg, S, V, h, w, "left", ELITE_CFG)
+    mrig = _edge_metrics(Hdeg, S, V, h, w, "right", ELITE_CFG)
 
-    ok_top, ok_bottom, ok_left, ok_right = mt["ok"], mb["ok"], ml["ok"], mr["ok"]
-    enough_edges = ((ok_top and ok_bottom) or (ok_left and ok_right) or
-                    (sum([ok_top, ok_bottom, ok_left, ok_right]) >= 3))
-    if not enough_edges:
-        return False, 0.0, {"gate": "edge_fail"}
+    okc = sum([mtop["ok"], mbot["ok"], mlef["ok"], mrig["ok"]])
+    if not ((mtop["ok"] and mbot["ok"]) or (mlef["ok"] and mrig["ok"]) or okc >= 3):
+        return False
 
-    score = float((mt["cstd"] + mb["cstd"] + ml["cstd"] + mr["cstd"]) / 4.0)
-    elite = score >= 60.0
-    return elite, score, {"score": round(score, 1)}
+    score = (mtop["cstd"] + mbot["cstd"] + mlef["cstd"] + mrig["cstd"]) / 4.0
+    return score >= 60.0
+def preproc(gray_or_rgb):
+    if isinstance(gray_or_rgb, Image.Image):
+        gray_or_rgb = np.array(gray_or_rgb)
+    if gray_or_rgb.ndim == 3:
+        return cv2.cvtColor(gray_or_rgb, cv2.COLOR_RGB2GRAY)
+    return gray_or_rgb
 
-def is_elite_card(card_img_bgr):
-    if card_img_bgr is None or card_img_bgr.size == 0:
-        return False, {"reason": "empty"}
-    raw_card_mask = _segment_card_mask(card_img_bgr)
-    ring_mask, bands_info = _make_frame_strips(raw_card_mask, bottom_exclude=0.22)
-    if ring_mask.sum() == 0:
-        return False, {"reason": "no_card"}
-    elite, score, dbg = _classify_ring(card_img_bgr, ring_mask, bands_info)
-    dbg["score"] = round(float(score), 3)
-    return elite, dbg
+def _clean_gen_text(texts: List[str]) -> Dict[str, int]:
+    out = {}
+    for t in texts:
+        if len(out) >= 3: break
+        t = (t or "").strip()
+        if not t: continue
+        # Special case: 6G123
+        m6 = re.match(r"^6G(\d{1,4})$", t.upper())
+        if m6:
+            out[f"G{m6.group(1)}"] = int(m6.group(1))
+            continue
+        z = re.sub(r"[^a-zA-Z0-9]", "", t)
+        z = (z.replace("i","1").replace("I","1")
+               .replace("o","0").replace("O","0")
+               .replace("g","9").replace("s","5").replace("S","5")
+               .replace("B","8").replace("l","1"))
+        if z and z[0] in ("0","6","5","9") and not z.upper().startswith("G"):
+            z = "G"+z[1:]
+        m = re.match(r"^G(\d{1,4})$", z.upper())
+        if m:
+            out[f"G{m.group(1)}"] = int(m.group(1))
+    return out
 
-def extract_card_for_index(index, card_crop):
+def _extract_name_series(texts: List[str]):
+    if not texts or len(texts) < 2: return None, None
+    gi = -1
+    for i,t in enumerate(texts):
+        if _clean_gen_text([t]): gi = i; break
+    if gi == -1: return None, None
+    name  = (texts[gi+1] if gi+1 < len(texts) else None) or ""
+    series= (texts[gi+2] if gi+2 < len(texts) else None) or ""
+    return name.strip(), series.strip()
+
+def extract_card_for_index(i: int, img: Image.Image):
     try:
-        if isinstance(card_crop, Image.Image):
-            rgb = np.array(card_crop)
-        else:
-            rgb = card_crop
-        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR) if rgb.ndim == 3 and rgb.shape[2] == 3 else rgb
-        elite, _ = is_elite_card(bgr)
-        processed = preprocess_image(card_crop)
-        gens, name, series = extract_generation_with_easyocr(processed)
-        return index, (gens, name, series, elite)
+        # Convert to RGB array
+        rgb = np.array(img) if isinstance(img, Image.Image) else img
+
+        # V2 uses 'preproc', not '_preproc_image'
+        gray = preproc(rgb)
+
+        # Prepare BGR for elite detector
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        elite = False
+        try:
+            elite = is_elite(bgr)
+        except Exception as e:
+            logging.warning(f"Elite detector error: {e}")
+
+        # Resize for OCR
+        resized = cv2.resize(
+            gray,
+            (300, int(gray.shape[0] * (300.0 / gray.shape[1]))),
+            interpolation=cv2.INTER_AREA,
+        )
+
+        # OCR text
+        texts = READER.readtext(resized, detail=0, batch_size=2)
+
+        # Extract gens / name / series
+        gens = _clean_gen_text(texts)
+        name, series = _extract_name_series(texts)
+
+        logging.info(
+            f"✅ Card {i}: Gen={list(gens.keys()) or '∅'}, "
+            f"Name='{name or ''}', Series='{series or ''}', Elite={elite}"
+        )
+
+        # IMPORTANT: V2 EXPECTS (i, dict)
+        return i, {
+            "generations": gens,
+            "name": name or "",
+            "series": series or "",
+            "elite": bool(elite),
+        }
+
     except Exception as e:
-        logging.warning(f"⚠️ Failed to process card index {index}: {e}")
-        return index, ({}, "", "", False)
+        logging.warning(f"card {i} OCR error: {e}")
+        return i, {"generations": {}, "name": "", "series": "", "elite": False}
 
-def extract_card_generations(image: Image.Image):
-    card_width = image.width // 3
-    card_info = {}
-    def _crop_card(i: int) -> Image.Image:
-        left = i * card_width
-        right = left + card_width if i < 2 else image.width
-        return image.crop((left, 0, right, image.height))
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [executor.submit(extract_card_for_index, i, _crop_card(i)) for i in range(3)]
-        for fut in futures:
+
+def extract_cards(img: Image.Image) -> Dict[int, dict]:
+    w = img.width//3
+    def crop(k):
+        L = k*w
+        R = L+w if k<2 else img.width
+        return img.crop((L,0,R,img.height))
+    out = {}
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        for fut in [ex.submit(extract_card_for_index, k, crop(k)) for k in range(3)]:
+            i, d = fut.result()
+            out[i] = d
+            logging.info(f"✅ Card {i}: Gen={list((d['generations'] or {}).keys()) or '∅'}, Name='{d['name']}', Series='{d['series']}', Elite={d['elite']}")
+    return out
+
+# ---------------- Likes parser ----------------
+def parse_likes(label: str) -> Optional[int]:
+    # Supports "1.9K", "2K", "3M" (rare), and "2,345"
+    s = (label or "").replace(",", "").strip()
+    m = re.search(r"(\d+(?:\.\d+)?)([kKmM]?)", s)
+    if not m:
+        return None
+    val = float(m.group(1))
+    suf = m.group(2).lower()
+    if suf == "k": val *= 1000
+    elif suf == "m": val *= 1_000_000
+    return int(round(val))
+
+# ---------------- Selenium helpers ----------------
+def _find_chrome_win() -> Optional[str]:
+    for p in [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    ]:
+        if os.path.isfile(p): return p
+    return shutil.which("chrome") or shutil.which("chrome.exe")
+
+def _is_writable(p: str) -> bool:
+    try:
+        os.makedirs(p, exist_ok=True)
+        tf = os.path.join(p, ".wtest")
+        with open(tf,"w") as f: f.write("ok")
+        os.remove(tf)
+        return True
+    except Exception:
+        return False
+
+class TopGGVoter:
+    def __init__(
+        self,
+        url: str,
+        profile_dir: str = None,
+        profile_name: str = None,
+        chrome_binary: str = None,
+        wait_secs: int = 10,
+        attach_debugger: bool = False,
+        debugger_address: str | None = None,
+    ):
+        self.url = url
+        self.profile_dir = (profile_dir or "").strip()
+        self.profile_name = (profile_name or "").strip()
+        self.chrome_binary = (chrome_binary or "").strip()
+        self.wait_secs = max(1, int(wait_secs))
+        self.attach_debugger = bool(attach_debugger)
+        self.debugger_address = (debugger_address or "").strip()
+
+    def _driver(self):
+        # Ensure driver exists (Selenium still needs it even for attach)
+        try:
+            chromedriver_autoinstaller.install()
+        except Exception as e:
+            logging.warning(f"[vote] chromedriver_autoinstaller issue: {e}")
+
+        opts = webdriver.ChromeOptions()
+
+        # --- ATTACH MODE (no profile flags!) ---
+        if self.attach_debugger and self.debugger_address:
+            opts.debugger_address = self.debugger_address
+            logging.info(f"[vote] Attaching to Chrome at {self.debugger_address} (debugger).")
             try:
-                i, (gens, name, series, elite) = fut.result()
-                card_info[i] = {
-                    "generations": gens or {},
-                    "name": name or "",
-                    "series": series or "",
-                    "elite": bool(elite),
-                }
-                logging.info(f"✅ Card {i}: Gen={list((gens or {}).keys()) or '∅'}, Name='{name or ''}', Series='{series or ''}', Elite={elite}")
+                drv = webdriver.Chrome(options=opts)
+                drv.set_window_size(1200, 900)
+                return drv
             except Exception as e:
-                logging.warning(f"⚠️ Failed to extract data for a card: {e}")
-                idx = len(card_info)
-                card_info[idx] = {"generations": {}, "name": "", "series": "", "elite": False}
-    return card_info
+                logging.warning(f"[vote] attach failed: {e}")
+                # Do NOT fall back to launching with the locked profile; just bubble up.
+                raise
 
-# --------------------------
-# Bot Manager
-# --------------------------
+        # --- LAUNCH MODE (used only if not attaching) ---
+        if not self.chrome_binary and sys.platform.startswith("win"):
+            auto = _find_chrome_win()
+            if auto:
+                self.chrome_binary = auto
+        if self.chrome_binary and os.path.isfile(self.chrome_binary):
+            opts.binary_location = self.chrome_binary
+
+        if self.profile_dir:
+            if not os.path.isdir(self.profile_dir):
+                logging.warning(f"[vote] profile dir not found: {self.profile_dir}")
+            elif not _is_writable(self.profile_dir):
+                logging.warning(f"[vote] profile dir not writable: {self.profile_dir}")
+            else:
+                opts.add_argument(f"--user-data-dir={self.profile_dir}")
+        if self.profile_name:
+            opts.add_argument(f"--profile-directory={self.profile_name}")
+
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_argument("--no-first-run")
+        opts.add_argument("--no-default-browser-check")
+        opts.add_argument("--disable-notifications")
+        opts.add_argument("--remote-debugging-port=0")
+        opts.add_argument("--remote-allow-origins=*")
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
+
+        drv = webdriver.Chrome(options=opts)
+        drv.set_window_size(1200, 900)
+        return drv
+
+
+    def _try_click(self, drv, xps, timeout=10):
+        for xp in xps:
+            try:
+                el = WebDriverWait(drv, timeout).until(EC.element_to_be_clickable((By.XPATH, xp)))
+                drv.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                el.click()
+                return True
+            except Exception:
+                continue
+        return False
+
+    def vote_once(self, tag: str = "") -> bool:
+        if not HAVE_SELENIUM:
+            logging.warning("[vote] Selenium not installed")
+            return False
+        drv = None
+        try:
+            drv = self._driver()
+            drv.get(self.url)
+            # cookies (best-effort)
+            try:
+                WebDriverWait(drv, 6).until(
+                    EC.any_of(
+                        EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Accept')]")),
+                        EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'I agree')]")),
+                    )
+                ).click()
+            except Exception:
+                pass
+            time.sleep(self.wait_secs)
+            # If already logged, Vote should be visible
+            if self._try_click(drv, ["//button[normalize-space()='Vote']",
+                                     "//a[normalize-space()='Vote']",
+                                     "//*[@data-qa='vote-button' or @data-testid='vote-button']"], timeout=8):
+                logging.info("[vote] Vote clicked on Top.gg")
+                return True
+            # If not, try quick login flow (user should already be logged in via profile; this is fallback)
+            self._try_click(drv, ["//a[normalize-space()='Log In']","//button[normalize-space()='Log In']"], timeout=6)
+            self._try_click(drv, ["//button[contains(., 'Discord')]", "//a[contains(., 'Discord')]"], timeout=8)
+            # After redirect back, attempt vote again
+            time.sleep(5)
+            if self._try_click(drv, ["//button[normalize-space()='Vote']",
+                                     "//a[normalize-space()='Vote']",
+                                     "//*[@data-qa='vote-button' or @data-testid='vote-button']"], timeout=8):
+                logging.info("[vote] Vote clicked on Top.gg")
+                return True
+            logging.warning("[vote] Vote button not found")
+            return False
+        except Exception as e:
+            logging.warning(f"[vote] failed: {e}")
+            return False
+        finally:
+            try:
+                if drv: drv.quit()
+            except Exception:
+                pass
+
+# ---------------- Sofi Bot Manager ----------------
 class SofiBotManager:
     SOFI_BOT_ID = "853629533855809596"
 
-    def __init__(self, cfg_path=".env"):
-        self.cfg_path = cfg_path
-        self.http = _create_http_session()
+    def __init__(self, env_path=".env"):
+        self.env_path = env_path
+        load_dotenv(env_path)
+
+        # .env
+        self.TOKEN    = os.getenv("DISCORD_TOKEN","")
+        self.GUILD_ID = os.getenv("GUILD_ID","")
+        self.CHANNEL  = os.getenv("CHANNEL_ID","")
+        self.USER_ID  = os.getenv("USER_ID","")
+
+        self.SD_INTERVAL = int(os.getenv("SD_INTERVAL_SEC","480"))
+        self.MODE   = os.getenv("MODE","smart").strip().lower()
+        self.P1     = os.getenv("NORM_P1","high_likes")
+        self.P2     = os.getenv("NORM_P2","low_gen")
+        self.P3     = os.getenv("NORM_P3","series")
+        self.SERIES = os.getenv("SERIES_NAME","").strip()
+
+        # smart scoring tunables
+        self.T_LIKE = int(os.getenv("T_LIKE","10"))
+        self.T_GEN  = int(os.getenv("T_GEN","40"))
+        self.WL_MIN = float(os.getenv("WL_MIN","0.15"))
+        self.WL_SPAN= float(os.getenv("WL_SPAN","0.70"))
+        self.LIKES_LOG_DAMP = (os.getenv("LIKES_LOG_DAMP","1")=="1")
+
+        # vote
+        self.VOTE_ENABLED = (os.getenv("TOPGG_VOTE_ENABLED","0")=="1")
+        self.VOTE_URL     = os.getenv("TOPGG_VOTE_URL","https://top.gg/bot/853629533855809596/vote")
+        self.VOTE_PROFILE_DIR  = os.getenv("TOPGG_CHROME_PROFILE_DIR","")
+        self.VOTE_PROFILE_NAME = os.getenv("TOPGG_CHROME_PROFILE_NAME","")
+        self.VOTE_CHROME_BIN   = os.getenv("TOPGG_CHROME_BINARY","")
+        self.VOTE_INTERVAL_H   = float(os.getenv("TOPGG_VOTE_INTERVAL_HOURS","12"))
+        self.VOTE_JITTER_MIN   = float(os.getenv("TOPGG_VOTE_JITTER_MINUTES","7"))
 
         # state
-        self.last_processed_time_lock = Lock()
-        self.pending_claim = {"message_id": None, "timestamp": None, "user_id": None, "triggered": False}
-        self.last_processed_time = 0
-        self.PROCESS_COOLDOWN_SECONDS = 240
-
-        self.stop_event = threading.Event()
-        self.bot = None
-        self.bot_thread = None
-        self.sd_thread = None
-        self.ka_thread = None
-        self.watchdog_thread = None
-        self.claim_timeout_thread = None
-
-        self.bot_identity_logged = False
-        self.sent_initial_sd = False
-        self._run_token = 0
-
-        # Connection health
+        self.http = http_session()
+        self.bot  = None
+        self.stop_evt = threading.Event()
         self.gateway_ready = False
-        self.last_gateway_event = 0.0
+        self.last_dispatch = 0.0
+        self.gateway_connect_started = 0.0
 
-        # Reboot guard
+        self.pending_claim = {"triggered": False, "timestamp": 0.0, "user_id": self.USER_ID}
+        self.CLAIM_CONFIRM_TIMEOUT = int(os.getenv("CLAIM_CONFIRM_TIMEOUT","15"))
+        self.POST_ACORN_NORMAL_DELAY = float(os.getenv("POST_ACORN_NORMAL_DELAY","0.8"))
+        self.last_processed_time = 0.0
+        self.last_processed_lock = threading.Lock()
+        self.PROCESS_COOLDOWN = 240
+
+        # voting guard
+        self.in_voting = threading.Event()
+        self._voting_lock = threading.Lock()
+        self.next_vote_at = 0.0
+
+        # watchdog
+        self.WATCHDOG_TIMEOUT = int(os.getenv("WATCHDOG_TIMEOUT","600"))
+        self.GATEWAY_READY_TIMEOUT = int(os.getenv("GATEWAY_READY_TIMEOUT","120"))
+        self.watchdog_grace_until = 0.0
+        # threads
+        self.t_gateway = None
+        self.t_sd = None
+        self.t_watch = None
+        self.t_claim_to = None
+        self.t_vote = None
+        self.next_sd_at = 0.0           # unix ts for next 'sd'
+        self.SD_BASE_INTERVAL = 480.0   # 8 minutes
+        self.SD_JITTER_SEC   = 8.0      # small human-ish jitter
+        # reboot guard
         self._reboot_lock = threading.Lock()
-        self._last_reboot_ts = 0.0
-        self.REBOOT_MIN_INTERVAL = 20.0  # avoid reboot loops
+        self._last_reboot = 0.0
+        self.REBOOT_MIN_INTERVAL = 20.0
+        self.last_sd_ts = 0.0
+        self.MIN_SD_SGR_GAP = float(os.getenv("SOFI_MIN_SD_SGR_GAP", "6.0"))   # seconds
+        self.STARTUP_SD_DELAY  = float(os.getenv("SOFI_STARTUP_SD_DELAY", "1.0"))
 
-        # Load env
-        load_dotenv(self.cfg_path)
-        self.TOKEN = os.getenv("DISCORD_TOKEN", "")
-        self.GUILD_ID = os.getenv("GUILD_ID", "")
-        self.CHANNEL_ID = os.getenv("CHANNEL_ID", "")
-        self.USER_ID = os.getenv("USER_ID", "")
-        self.SD_INTERVAL_SEC = int(os.getenv("SD_INTERVAL_SEC", "480"))
-        self.USE_GPU = (os.getenv("OCR_USE_GPU", "0") == "1")
+    # ---------- lifecycle ----------
 
-        # Interaction timing & retries
-        self.CLAIM_CONFIRM_TIMEOUT = int(os.getenv("CLAIM_CONFIRM_TIMEOUT", "15"))
-        self.POST_ACORN_NORMAL_DELAY = float(os.getenv("POST_ACORN_NORMAL_DELAY", "0.8"))
+        
+    def start(self):
+        global READER
+        logging.info(f"🔎 Initializing EasyOCR (gpu=False) …")
+        if READER is None:
+            READER = easyocr.Reader(["en"], gpu=False, verbose=False)
+            _ = READER.readtext(np.zeros((50,50,3),dtype=np.uint8), detail=0)
 
-        # Mode: "smart" or "normal"
-        self.MODE = os.getenv("MODE", "smart").strip().lower()
-        if self.MODE not in ("smart", "normal"):
-            self.MODE = "smart"
+        self.stop_evt.clear()
+        self.bot = discum.Client(token=self.TOKEN, log=False)
+        self._install_handlers()
 
-        # Normal mode priorities (ordered 1..3)
-        self.NORM_P1 = os.getenv("NORM_P1", "high_likes").strip().lower()
-        self.NORM_P2 = os.getenv("NORM_P2", "low_gen").strip().lower()
-        self.NORM_P3 = os.getenv("NORM_P3", "series").strip().lower()
-        self._normalize_normal_priorities()
+        self.gateway_ready = False
+        self.last_dispatch = 0.0
+        self.gateway_connect_started = time.time()
+        self.watchdog_grace_until = time.time() + 180  # grace at (re)start
 
-        # Optional series name for matching/bonus
-        self.series_preference = os.getenv("SERIES_NAME", "").strip()
+        # threads
+        if not self.t_sd or not self.t_sd.is_alive():
+            self.t_sd = threading.Thread(target=self._sd_loop, daemon=True); self.t_sd.start()
+        if not self.t_watch or not self.t_watch.is_alive():
+            self.t_watch = threading.Thread(target=self._watchdog_loop, daemon=True); self.t_watch.start()
+        if not self.t_claim_to or not self.t_claim_to.is_alive():
+            self.t_claim_to = threading.Thread(target=self._claim_timeout_loop, daemon=True); self.t_claim_to.start()
+        if self.VOTE_ENABLED and HAVE_SELENIUM and (not self.t_vote or not self.t_vote.is_alive()):
+            self.t_vote = threading.Thread(target=self._vote_loop, daemon=True); self.t_vote.start()
 
-        # Adaptive scoring tunables (Smart mode)
-        self.SCORE_BONUS_SERIES = float(os.getenv("SCORE_BONUS_SERIES", "0.12"))
-        self.SCORE_BONUS_NOGEN  = float(os.getenv("SCORE_BONUS_NOGEN",  "0.03"))
-        self.T_LIKE = int(os.getenv("T_LIKE", "10"))
-        self.T_GEN  = int(os.getenv("T_GEN",  "40"))
-        self.WL_MIN = float(os.getenv("WL_MIN", "0.15"))
-        self.WL_SPAN = float(os.getenv("WL_SPAN", "0.70"))
-        self.LIKES_LOG_DAMP = (os.getenv("LIKES_LOG_DAMP", "1") == "1")
+        def run_gw():
+            logging.info("🔌 Connecting to Discord gateway …")
+            try:
+                self.bot.gateway.run(auto_reconnect=True)
+            except Exception as e:
+                logging.critical(f"Gateway run error: {e}")
+        if not self.t_gateway or not self.t_gateway.is_alive():
+            self.t_gateway = threading.Thread(target=run_gw, daemon=True); self.t_gateway.start()
+        # send first 'sd' right away
+        self.next_sd_at = time.time() + 1.0
 
-        # Watchdog timeouts
-        self.WATCHDOG_TIMEOUT = int(os.getenv("WATCHDOG_TIMEOUT", "600"))     # no events → reboot
-        self.GATEWAY_READY_TIMEOUT = int(os.getenv("GATEWAY_READY_TIMEOUT", "120"))  # no READY after connect → reboot
+    def stop(self):
+        logging.info("🛑 Stopping bot …")
+        self.stop_evt.set()
+        try:
+            if self.bot and self.bot.gateway:
+                self.bot.gateway.close()
+        except Exception:
+            pass
+        for t in (self.t_sd, self.t_watch, self.t_claim_to, self.t_vote):
+            if t and t.is_alive():
+                try: t.join(timeout=2.0)
+                except Exception: pass
+        if self.t_gateway and self.t_gateway.is_alive():
+            try: self.t_gateway.join(timeout=3.0)
+            except Exception: pass
+        self.t_gateway = self.t_sd = self.t_watch = self.t_claim_to = self.t_vote = None
+        logging.info("✅ Bot stopped.")
 
-        # Track connect start to enforce READY timeout
-        self.gateway_start_time = 0.0
-
-    def _normalize_normal_priorities(self):
-        allowed = ["high_likes", "low_gen", "no_gen", "series"]
-        picks = [p for p in [self.NORM_P1, self.NORM_P2, self.NORM_P3] if p in allowed]
-        # fill with remaining unique options
-        for a in allowed:
-            if a not in picks:
-                picks.append(a)
-        self.NORM_P1, self.NORM_P2, self.NORM_P3 = picks[:3]
-
-    # --------- Reboot (stop -> start) ---------
-    def reboot_bot(self, reason: str):
-        """Hard reboot: stop everything, then start with fresh gateway."""
+    def reboot(self, reason: str):
         now = time.time()
-        if (now - self._last_reboot_ts) < self.REBOOT_MIN_INTERVAL:
+        if now - self._last_reboot < self.REBOOT_MIN_INTERVAL:
             logging.warning(f"⏳ Reboot suppressed (too soon). Reason: {reason}")
             return
-        if not self._reboot_lock.acquire(blocking=False):
+        if not self._reboot_lock.acquire(False):
             return
         try:
-            self._last_reboot_ts = now
-            logging.error(f"🔄 REBOOTING BOT — Reason: {reason}")
-            self.stop(internal=True)
+            self._last_reboot = now
+            logging.error(f"🔄 REBOOT — {reason}")
+            self.stop()
             time.sleep(1.0)
             self.start()
         finally:
             self._reboot_lock.release()
 
-    # --------- Threads ---------
-    def message_watchdog(self):
-        while not self.stop_event.is_set():
-            time.sleep(5)
-            if not self.bot or not getattr(self.bot, "gateway", None):
-                continue
-            last = self.last_gateway_event or (time.time() - 30)
-            elapsed = time.time() - last
-            # If no Dispatch events for a long time assume dead session and reboot
-            if elapsed > self.WATCHDOG_TIMEOUT:
-                self.reboot_bot(f"No gateway events for {elapsed:.1f}s")
+    # ---------- threads ----------
+    def _sd_loop(self):
+     while not self.stop_evt.is_set():
+        # If gateway not ready, wait a hair and retry
+        if not self.gateway_ready:
+            self.stop_evt.wait(1.0)
+            continue
+
+        # Schedule bootstrap if not set
+        if self.next_sd_at <= 0:
+            self.next_sd_at = time.time() + 1.0
+
+        now = time.time()
+        if now >= self.next_sd_at:
+            try:
+                self.bot.sendMessage(self.CHANNEL, "sd")
+                logging.info("📤 drop 'sd' (sofi)")
+                self.last_sd_ts = time.time()
+                # Treat our own sd as activity to keep watchdog calm
+            except Exception as e:
+                logging.warning(f"sd send error: {e}")
+
+            # schedule next 'sd'
+            wait = float(self.SD_INTERVAL) + random.uniform(0, self.SD_JITTER_SEC)
+            self.next_sd_at = time.time() + wait
+
+        # sleep until next tick
+        self.stop_evt.wait(0.5)
+
+    def _watchdog_loop(self):
+        logging.info("[watchdog] Started")
+        while not self.stop_evt.is_set():
+            now = time.time()
+
+            # 1) If we have a gateway thread and it died, reboot immediately
+            t = getattr(self, "t_gateway", None)
+            if t is not None and not t.is_alive():
+                logging.error("🔄 REBOOT — gateway thread died")
+                self.reboot("gateway thread died")
                 return
 
-            # If we're still not READY after connecting for too long, reboot
-            if (not self.gateway_ready) and self.gateway_start_time:
-                since_conn = time.time() - self.gateway_start_time
-                if since_conn > self.GATEWAY_READY_TIMEOUT:
-                    self.reboot_bot("Gateway did not reach READY in time")
+            # 2) Respect grace period (startup, vote, etc.)
+            if now < self.watchdog_grace_until:
+                self.stop_evt.wait(5.0)
+                continue
+
+            # 3) No gateway events for too long? Reboot.
+            last = self.last_dispatch or 0.0
+            if self.gateway_ready and last:
+                delta = now - last
+                if delta > self.WATCHDOG_TIMEOUT:
+                    logging.error(
+                        f"🔄 REBOOT — no gateway events for {int(delta)}s "
+                        f"(timeout={self.WATCHDOG_TIMEOUT}s)"
+                    )
+                    self.reboot("no gateway events")
                     return
 
-    def reset_claim_if_timed_out(self):
-        while not self.stop_event.is_set():
+            # 4) Sleep a bit before next check
+            self.stop_evt.wait(10.0)
+
+    def _claim_timeout_loop(self):
+        while not self.stop_evt.is_set():
             time.sleep(0.5)
             if self.pending_claim["triggered"]:
-                elapsed = time.time() - (self.pending_claim["timestamp"] or 0)
-                if elapsed > self.CLAIM_CONFIRM_TIMEOUT:
-                    logging.warning("⚠️ No Sofi confirmation received. Resetting claim trigger (timeout).")
+                if (time.time() - self.pending_claim["timestamp"]) > self.CLAIM_CONFIRM_TIMEOUT:
+                    logging.warning("⏱️ Claim confirmation timeout. Resetting trigger.")
                     self.pending_claim["triggered"] = False
 
-    def periodic_sd_sender(self):
-        run_token = self._run_token
-        while not self.stop_event.is_set():
-            base = float(self.SD_INTERVAL_SEC)
-            wait_time = max(300.0, base + random.uniform(2, 12))
-            logging.info(f"⏳ Waiting {wait_time:.1f}s before sending next 'sd'…")
-            if self.stop_event.wait(wait_time): break
-            if run_token != self._run_token: return
+    def _vote_loop(self):
+        voter = TopGGVoter(
+            self.VOTE_URL,
+            self.VOTE_PROFILE_DIR or None,
+            self.VOTE_PROFILE_NAME or "Default",
+            self.VOTE_CHROME_BIN or None,
+            wait_secs=10,
+            attach_debugger=True,
+            debugger_address="127.0.0.1:9222",
+        )
 
-            # REBOOT if gateway not READY when we want to send 'sd'
-            ready = (self.gateway_ready and self.bot and getattr(self.bot.gateway, "session_id", None))
-            if not ready:
-                logging.warning("⚠️ Gateway not READY at 'sd' send time. Initiating REBOOT.")
-                self.reboot_bot("Gateway not READY when sending sd")
+        def do_vote(tag=""):
+            try:
+                ok = voter.vote_once(tag or "")
+            except Exception as e:
+                logging.warning(f"[vote] error: {e}")
+                ok = False
+            self.watchdog_grace_until = max(self.watchdog_grace_until, time.time() + 240)
+            return ok
+
+        # --- Startup vote ---
+        logging.info("[vote] Attempting Top.gg vote (startup)…")
+        ok = do_vote("(startup)")
+        wait = self.VOTE_INTERVAL_H * 3600 + random.uniform(0, self.VOTE_JITTER_MIN * 60)
+        self.next_vote_at = time.time() + wait
+        logging.info(f"[vote] Vote {'OK' if ok else 'FAILED'} — next in ~{int(wait)}s")
+
+        # --- Main vote loop ---
+        while not self.stop_evt.is_set():
+            rem = self.next_vote_at - time.time()
+            if rem <= 0:
+                ok = do_vote()
+                wait = self.VOTE_INTERVAL_H * 3600 + random.uniform(0, self.VOTE_JITTER_MIN * 60)
+                self.next_vote_at = time.time() + wait
+                logging.info(f"[vote] Vote {'OK' if ok else 'FAILED'} — next in ~{int(wait)}s")
+
+            self.stop_evt.wait(min(30.0, max(1.0, rem)))
+    # ---------- gateway handlers ----------
+    def _install_handlers(self):
+        @self.bot.gateway.command
+        def any_event(resp):
+            try:
+                self.last_dispatch = time.time()
+            except Exception:
+                pass
+
+        @self.bot.gateway.command
+        def ready(resp):
+            if not resp.event.ready: return
+            u = resp.parsed.auto().get("user")
+            if u:
+                logging.info(f"✅ READY as {u['username']}#{u['discriminator']}")
+            self.gateway_ready = True
+            self.next_sd_at = time.time() + self.STARTUP_SD_DELAY
+
+            if self.next_sd_at <= 0:
+                self.next_sd_at = time.time() + 1.0
+            self.gateway_connect_started = 0.0
+           
+
+        @self.bot.gateway.command
+        def on_message(resp):
+            if not hasattr(resp,"raw") or resp.raw.get("t") != "MESSAGE_CREATE":
+                return
+            d = resp.raw["d"]
+            m = resp.parsed.auto()
+
+            author_id = str(d.get("author", {}).get("id"))
+            if author_id != SofiBotManager.SOFI_BOT_ID:
                 return
 
-            try:
-                self.bot.sendMessage(self.CHANNEL_ID, "sd")
-                logging.info("📤 Sent 'sd' command.")
-            except Exception:
-                logging.exception("⚠️ Failed to send 'sd'")
+            channel_id = str(d.get("channel_id"))
+            guild_id   = str(d.get("guild_id")) if d.get("guild_id") else None
+            content    = d.get("content", "")
+            comps      = d.get("components", []) or []
+            atts       = d.get("attachments", []) or []
+            embeds     = d.get("embeds", []) or []
+                # confirmation
+            if self.pending_claim["triggered"]:
+                uid = self.pending_claim["user_id"]
+                content_l = content.lower()
 
-    def keep_alive(self):
-        same_latency_count = 0
-        self._prev_latency = None
-        while not self.stop_event.is_set():
-            if self.stop_event.wait(30): break
-            try:
-                gw = getattr(self.bot, "gateway", None)
-                latency = gw.latency if gw else None
-                if latency is None:
-                    same_latency_count += 1
+                # Sofi confirmation patterns (robust)
+                patterns = [
+                    f"<@{uid}>",                  # must mention the user
+                    "grabbed",                    # Sofi confirmation verb
+                    "fought off",                 # Rare boss cards
+                    "successfully grabbed",       # Sometimes used
+                    "claimed the",                # Some variants
+                    "took the",                   # Some servers
+                ]
+
+                if all(p in content_l for p in [f"<@{uid}>", "grab"]):
+                    matched = True
                 else:
-                    prev = getattr(self, "_prev_latency", None)
-                    same_latency_count = same_latency_count + 1 if prev == latency else 0
-                    self._prev_latency = latency
-                if same_latency_count >= 3:
-                    self.reboot_bot("Gateway appears frozen (latency unchanged)")
-                    return
-            except Exception as e:
-                logging.error(f"keep_alive error: {e}")
+                    matched = any(p in content_l for p in patterns)
 
-    # --------- Button click helpers ---------
-    def click_discord_button(self, custom_id, channel_id, guild_id, m):
+                if matched:
+                    logging.info(f"✅ Claim confirmed: {content[:200]}…")
+                    with self.last_processed_lock:
+                        self.last_processed_time = time.time()
+                    self.pending_claim["triggered"] = False
+                    return
+
+            # --- Collect image URLs from attachments + embeds ---
+            img_urls = []
+
+            # 1) Attachments (old behavior)
+            for a in atts:
+                fn  = (a.get("filename", "") or "").lower()
+                url = a.get("url")
+                if url and any(fn.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp")):
+                    img_urls.append(url)
+
+            # 2) Embeds: image + thumbnail
+            for e in embeds:
+                img = e.get("image") or {}
+                url = img.get("url")
+                if url:
+                    img_urls.append(url)
+
+                thumb = e.get("thumbnail") or {}
+                turl = thumb.get("url")
+                if turl:
+                    img_urls.append(turl)
+
+            # Require buttons + at least one image URL
+            if not comps or not img_urls:
+                return
+
+            logging.info(f"🎴 Sofi drop seen: comps={len(comps)} imgs={len(img_urls)}")
+
+            def worker(url):
+                pil = pil_from_url(self.http, url)
+                if not pil:
+                    return
+                try:
+                    self._pick_from_image(pil, comps, channel_id, guild_id, m)
+                except Exception as e:
+                    logging.warning(f"process drop error: {e}")
+
+            # Limit to first 3 images (3 cards)
+            for url in img_urls[:3]:
+                threading.Thread(target=worker, args=(url,), daemon=True).start()
+
+    # ---------- buttons & claims ----------
+    def _btn_click(self, button_id, channel_id, guild_id, m, tag=""):
         try:
             self.bot.click(
                 applicationID=m["author"]["id"],
@@ -557,766 +865,521 @@ class SofiBotManager:
                 guildID=m.get("guild_id"),
                 messageID=m["id"],
                 messageFlags=m["flags"],
-                data={"component_type": 2, "custom_id": custom_id},
+                data={"component_type": 2, "custom_id": button_id},
             )
-            logging.info(f"➡️  Clicked button {custom_id}")
+            if tag: logging.info(tag)
         except Exception as e:
-            logging.warning(f"Exception during click: {e}")
+            logging.warning(f"button click error: {e}")
 
-    def _click_normal_with_retry(self, button_id, channel_id, guild_id, m, reason: str):
-        """Click a normal-claim button, wait for confirmation up to CLAIM_CONFIRM_TIMEOUT; retry once if needed."""
-        def do_click():
-            try:
-                self.click_discord_button(button_id, channel_id, guild_id, m)
-                self.pending_claim["timestamp"] = time.time()
-                self.pending_claim["triggered"] = True
-                self.pending_claim["user_id"] = self.USER_ID
-                logging.info(f"🔘 NORMAL click: {reason}")
-            except Exception as e:
-                logging.warning(f"Normal click failed: {e}")
-
-        # 1st attempt
-        do_click()
+    def _normal_click_with_confirm(self, button_id, channel_id, guild_id, m, reason):
+        self._btn_click(button_id, channel_id, guild_id, m, tag=f"🔘 NORMAL click: {reason}")
+        self.pending_claim.update(triggered=True, timestamp=time.time())
+        # wait confirm
         t0 = time.time()
-        while self.pending_claim["triggered"] and (time.time() - t0) < self.CLAIM_CONFIRM_TIMEOUT:
+        while self.pending_claim["triggered"] and (time.time()-t0) < self.CLAIM_CONFIRM_TIMEOUT:
             time.sleep(0.25)
-
         if self.pending_claim["triggered"]:
-            logging.warning("⏱️ No confirmation yet. Retrying normal click once …")
+            logging.warning("⏱️ No confirmation. Retrying once …")
             self.pending_claim["triggered"] = False
             time.sleep(0.4)
-            do_click()
+            self._btn_click(button_id, channel_id, guild_id, m, tag=f"🔘 NORMAL click (retry): {reason}")
             t1 = time.time()
-            while self.pending_claim["triggered"] and (time.time() - t1) < self.CLAIM_CONFIRM_TIMEOUT:
+            self.pending_claim.update(triggered=True, timestamp=t1)
+            while self.pending_claim["triggered"] and (time.time()-t1) < self.CLAIM_CONFIRM_TIMEOUT:
                 time.sleep(0.25)
             if self.pending_claim["triggered"]:
-                logging.error("❌ Normal claim still not confirmed after retry.")
+                logging.error("❌ Still no confirmation after retry.")
                 self.pending_claim["triggered"] = False
 
-    # --------- Core claim logic ---------
-    def click_bouquet_then_best_from_image(self, pil_image, buttons_components, image_received_time, channel_id, guild_id, m):
-        import numpy as np
-        def blocked(ignore=False) -> bool:
-            if ignore: return False
-            now = time.time()
-            with self.last_processed_time_lock:
-                cooldown_active = self.last_processed_time and (now - self.last_processed_time < self.PROCESS_COOLDOWN_SECONDS)
-                pending_active  = self.pending_claim.get("triggered", False)
-                if pending_active:
-                    logging.info("⏳ Skipping — waiting previous claim confirmation."); return True
-                if cooldown_active:
-                    logging.info("⏳ Skipping — cooldown not expired."); return True
-            return False
+    def _blocked(self, ignore=False) -> bool:
+        if ignore: return False
+        with self.last_processed_lock:
+            cooldown = self.last_processed_time and (time.time()-self.last_processed_time < self.PROCESS_COOLDOWN)
+            pend = self.pending_claim.get("triggered", False)
+        if pend:
+            logging.info("⏳ Skip — waiting previous claim confirmation.")
+            return True
+        if cooldown:
+            logging.info("⏳ Skip — cooldown not expired.")
+            return True
+        return False
 
-        # Parse claim buttons; ignore URL buttons; ignore beyond first 3.
-                # Parse claim buttons; ignore URL buttons; ignore beyond first 3.
-        pos_buttons = []
-        for row in buttons_components:
-            for btn in row.get("components", []):
-                if btn.get("type") != 2 or not btn.get("custom_id"):
+    def _pick_from_image(self, img: Image.Image, components, channel_id, guild_id, m):
+        # parse buttons (ignore links; ignore beyond first 3)
+        pos_btns = []
+        for row in components:
+            for b in row.get("components", []):
+                if b.get("type") != 2 or not b.get("custom_id"):  # not a button or url button
                     continue
-                label = str(btn.get("label") or "")
+                label = str(b.get("label") or "")
+                likes = parse_likes(label)     # None means acorn/event
+                pos_btns.append({"id": b["custom_id"], "likes": likes, "label": label})
+        pos_btns = pos_btns[:3]
+        if not pos_btns:
+            logging.warning("No claimable buttons found."); return
 
-                # --- NEW robust likes parser: supports 1.9K, 2K, 2,345, 3M, etc. ---
-                def _parse_likes(s: str):
-                    s = (s or "").strip().replace(",", "")
-                    m = re.search(r"([\d]+(?:\.\d+)?)\s*([kK]?)", s)
-                    if not m:
-                        return None  # acorn / event buttons have no number
-                    val = float(m.group(1))
-                    suf = m.group(2).lower()
-                    if suf == "k":
-                        val *= 1000.0
-                    return int(round(val))
-                # ---------------------------------------------------------------
-                likes = _parse_likes(label)
-                pos_buttons.append({"id": btn["custom_id"], "likes": likes, "label": label})
-        pos_buttons = pos_buttons[:3]
+        acorn_pos  = [i for i,b in enumerate(pos_btns) if b["likes"] is None]
+        normal_pos = [i for i,b in enumerate(pos_btns) if b["likes"] is not None]
 
+        cards = extract_cards(img)
 
-        if not pos_buttons:
-            logging.warning("No claimable buttons found (ignoring link buttons). Abort."); return
-
-        acorn_positions  = [i for i, b in enumerate(pos_buttons) if b["likes"] is None]
-        normal_positions = [i for i, b in enumerate(pos_buttons) if b["likes"] is not None]
-
-        # OCR/gen extraction
-        card_info = extract_card_generations(pil_image)
-
-        # 1) Acorns first (claim all)
+        # 1) acorns first (claim all), non-blocking
         acorn_clicked = False
-        if acorn_positions:
-            for idx, pos in enumerate(acorn_positions, start=1):
-                try:
-                    self.click_discord_button(pos_buttons[pos]["id"], channel_id, guild_id, m)
-                    logging.info(f"🌰 Claimed acorn at position {pos+1} (#{idx}).")
-                    acorn_clicked = True
-                    time.sleep(3)
-                except Exception as e:
-                    logging.warning(f"Acorn click failed at pos {pos+1}: {e}")
+        for idx, p in enumerate(acorn_pos, start=1):
+            try:
+                self._btn_click(pos_btns[p]["id"], channel_id, guild_id, m, tag=f"🌰 Acorn click #{idx} (pos {p+1})")
+                acorn_clicked = True
+                time.sleep(0.25)
+            except Exception as e:
+                logging.warning(f"acorn click failed pos {p+1}: {e}")
 
-        # If ALL are acorns, we’re done
-        if not normal_positions:
-            logging.info("🌰 All buttons were acorns — no normal claims to process.")
+        if not normal_pos:
+            logging.info("🌰 All buttons are acorns — done.")
             return
 
-        # Pause after acorns so next click is seen
         if acorn_clicked:
             time.sleep(self.POST_ACORN_NORMAL_DELAY)
 
-        # Assemble cards
-        cards = []
-        for i in range(3):
-            info = card_info.get(i, {}) or {}
-            gens = info.get("generations", {}) or {}
+        # assemble normal candidates
+        cands = []
+        for i in normal_pos:
+            info = cards.get(i, {})
+            gens = info.get("generations",{}) or {}
             min_gen = min(gens.values()) if gens else None
-            like_val = pos_buttons[i]["likes"] if i < len(pos_buttons) else 0
-            cards.append({
+            cands.append({
                 "pos": i,
-                "likes": like_val if like_val is not None else 0,
-                "gens": gens,
+                "likes": pos_btns[i]["likes"] or 0,
                 "min_gen": min_gen,
                 "has_gen": bool(gens),
-                "name": info.get("name") or "",
-                "series": info.get("series") or "",
+                "series": info.get("series","") or "",
                 "elite": bool(info.get("elite", False)),
             })
 
-        # Consider only normals after acorns
-        normals = [cards[p] for p in normal_positions]
-
-        # 2) ELITE fast path
-        elite_pos = next((c["pos"] for c in normals if c["elite"]), None)
-        if elite_pos is not None:
-            if not blocked(ignore=acorn_clicked):
-                reason = f"pos {elite_pos+1} | ELITE"
-                self._click_normal_with_retry(pos_buttons[elite_pos]["id"], channel_id, guild_id, m, reason)
+        # 2) ELITE
+        e = next((c for c in cands if c["elite"]), None)
+        if e:
+            if not self._blocked(ignore=acorn_clicked):
+                self._normal_click_with_confirm(pos_btns[e["pos"]]["id"], channel_id, guild_id, m, "ELITE")
             return
 
-        # 3) ABS GEN < 10 fast path
-        ultra = [c for c in normals if c["min_gen"] is not None and c["min_gen"] < 10]
-        if ultra:
-            ultra.sort(key=lambda c: (c["min_gen"], -c["likes"], c["pos"]))
-            chosen = ultra[0]
-            if not blocked(ignore=acorn_clicked):
-                reason = f"pos {chosen['pos']+1} | ABS gen<10 | G{chosen['min_gen']} | likes={chosen['likes']}"
-                self._click_normal_with_retry(pos_buttons[chosen["pos"]]["id"], channel_id, guild_id, m, reason)
+        # 3) ABS GEN < 10
+        sub10 = [c for c in cands if (c["min_gen"] is not None and c["min_gen"] < 10)]
+        if sub10:
+            sub10.sort(key=lambda c: (c["min_gen"], -c["likes"], c["pos"]))
+            ch = sub10[0]
+            if not self._blocked(ignore=acorn_clicked):
+                self._normal_click_with_confirm(pos_btns[ch["pos"]]["id"], channel_id, guild_id, m,
+                                                f"ABS gen<10 | G{ch['min_gen']} | likes={ch['likes']}")
             return
 
-        # 4) Mode-specific choice
-        mode = self.MODE
+        # 4) Smart/Normal
+        series_key = (self.SERIES or "").lower()
 
-        # ---- Shared helpers ----
-        series_key = (self.series_preference or "").strip().lower()
-        likes_values = [c["likes"] for c in normals]
-        max_likes = max(likes_values) if likes_values else 0
-        min_likes = min(likes_values) if likes_values else 0
-        like_gap  = max_likes - min_likes
+        if self.MODE == "smart":
+            likes_vals = [c["likes"] for c in cands]
+            max_likes = max(likes_vals) if likes_vals else 0
+            gen_vals  = [c["min_gen"] for c in cands if c["min_gen"] is not None]
+            min_gen, max_gen = (min(gen_vals), max(gen_vals)) if gen_vals else (None, None)
+            like_gap = (max(likes_vals)-min(likes_vals)) if likes_vals else 0
+            gen_gap  = (max_gen-min_gen) if gen_vals else 0
 
-        gen_vals = [c["min_gen"] for c in normals if c["min_gen"] is not None]
-        gen_gap  = (max(gen_vals) - min(gen_vals)) if gen_vals else 0
-        min_seen_gen = min(gen_vals) if gen_vals else None
-        max_seen_gen = max(gen_vals) if gen_vals else None
+            L = like_gap / (like_gap + self.T_LIKE) if like_gap>0 else 0.0
+            Gtight = 1.0 - (gen_gap/(gen_gap + self.T_GEN)) if gen_gap>0 else 1.0
+            wL = max(0.1, min(0.9, self.WL_MIN + self.WL_SPAN * (0.5*(L+Gtight))))
+            wG = 1.0 - wL
+            logging.info(f"⚖️ SMART weights: likes={wL:.2f}, gen={wG:.2f}  (Δlikes={like_gap}, Δgen={gen_gap})")
 
-        def series_filter(pool):
-            if not series_key:
-                return []
-            return [c for c in pool if series_key in (c["series"] or "").lower()]
+            def score(c):
+                # likes (log damped by default)
+                if max_likes>0:
+                    like_norm = (np.log1p(c["likes"])/max(1e-9, np.log1p(max_likes))) if self.LIKES_LOG_DAMP else (c["likes"]/max_likes)
+                else:
+                    like_norm = 0.0
+                if (c["min_gen"] is None or min_gen is None or max_gen is None or max_gen==min_gen):
+                    gen_norm = 0.0
+                    nog_bonus = 0.03 if not c["has_gen"] else 0.0
+                else:
+                    # lower gen -> higher score
+                    gen_norm = (max_gen - c["min_gen"]) / max(1.0, (max_gen - min_gen))
+                    nog_bonus = 0.0
+                ser_bonus = 0.12 if (series_key and series_key in c["series"].lower()) else 0.0
+                return wL*like_norm + wG*gen_norm + ser_bonus + nog_bonus
 
-        def tiebreak(pool):
-            # final deterministic tie-breaker
+            for c in cands: c["score"]=score(c)
+            cands.sort(key=lambda c: (-c["score"],
+                                      c["min_gen"] if c["min_gen"] is not None else 10**9,
+                                      -c["likes"], c["pos"]))
+            ch = cands[0]
+            if not self._blocked(ignore=acorn_clicked):
+                self._normal_click_with_confirm(pos_btns[ch["pos"]]["id"], channel_id, guild_id, m,
+                                                f"SMART score={ch['score']:.3f} | G{ch['min_gen'] if ch['min_gen'] is not None else '∅'} | likes={ch['likes']}")
+            return
+
+        # Normal mode priorities
+        def apply_pref(pref, pool):
+            if pref == "high_likes":
+                mx = max(c["likes"] for c in pool) if pool else None
+                return [c for c in pool if c["likes"]==mx] if mx is not None else []
+            if pref == "low_gen":
+                g = [c["min_gen"] for c in pool if c["min_gen"] is not None]
+                if not g: return []
+                mn = min(g)
+                return [c for c in pool if c["min_gen"]==mn]
+            if pref == "no_gen":
+                return [c for c in pool if (c["min_gen"] is None or not c["has_gen"])]
+            if pref == "series":
+                if not series_key: return []
+                return [c for c in pool if series_key in c["series"].lower()]
+            return pool
+
+        def tie_break(pool):
             pool.sort(key=lambda c: (
-                c["min_gen"] if c["min_gen"] is not None else 10**9,  # prefer lower gen if known
-                -c["likes"],                                          # then higher likes
-                c["pos"]
+                c["min_gen"] if c["min_gen"] is not None else 10**9,
+                -c["likes"], c["pos"]
             ))
             return pool[0]
 
-        # ---------- Enhanced logging: candidate table ----------
-        def fmt(c):
-            g = (f"G{c['min_gen']}" if c["min_gen"] is not None else "∅")
-            el = "E" if c["elite"] else "-"
-            sc = f"{c.get('score', 0):.3f}" if "score" in c else "---"
-            return f"{c['pos']+1:^3} | {g:>4} | {c['likes']:>4} | {el:^1} | {sc:>6}"
-
-        header = "pos | gen  | like | E | score "
-        logging.info("📋 Candidates (normals):\n  " + header + "\n  " + "-"*len(header))
-        for c in normals:
-            logging.info("  " + fmt(c))
-
-        if mode == "smart":
-            # ===== SMART MODE: ADAPTIVE SCORING =====
-            T_LIKE = self.T_LIKE
-            T_GEN  = self.T_GEN
-            WL_MIN = self.WL_MIN
-            WL_SPAN = self.WL_SPAN
-            LIKES_LOG_DAMP = self.LIKES_LOG_DAMP
-
-            L = like_gap / (like_gap + T_LIKE) if like_gap > 0 else 0.0
-            Gtight = 1.0 - (gen_gap / (gen_gap + T_GEN)) if gen_gap > 0 else 1.0
-
-            wL = max(0.1, min(0.9, WL_MIN + WL_SPAN * (0.5 * (L + Gtight))))
-            wG = 1.0 - wL
-            logging.info(f"⚖️ SMART weights → likes={wL:.2f}, gen={wG:.2f}  (gap: likes={like_gap}, gen={gen_gap})")
-
-            def score(c):
-                # Likes contribution (log-damped by default)
-                if max_likes <= 0:
-                    like_norm = 0.0
-                else:
-                    like_norm = (np.log1p(c["likes"]) / max(1e-9, np.log1p(max_likes))) if LIKES_LOG_DAMP else (c["likes"] / max_likes)
-                # Gen contribution: LOWER gen => HIGHER score
-                if (c["min_gen"] is None or
-                    min_seen_gen is None or max_seen_gen is None or max_seen_gen == min_seen_gen):
-                    gen_norm = 0.0
-                    nog_bonus = self.SCORE_BONUS_NOGEN if not c["has_gen"] else 0.0
-                else:
-                    gen_norm = (max_seen_gen - c["min_gen"]) / max(1.0, (max_seen_gen - min_seen_gen))
-                    nog_bonus = 0.0
-                series_bonus = self.SCORE_BONUS_SERIES if (series_key and series_key in (c["series"] or "").lower()) else 0.0
-                return wL * like_norm + wG * gen_norm + series_bonus + nog_bonus
-
-            for c in normals:
-                c["score"] = score(c)
-
-            # Re-log with scores
-            logging.info("📊 SMART scores:")
-            for c in normals:
-                logging.info("  " + fmt(c))
-
-            normals.sort(key=lambda c: (-c["score"],
-                                        c["min_gen"] if c["min_gen"] is not None else 10**9,
-                                        -c["likes"], c["pos"]))
-            chosen = normals[0]
-            if not blocked(ignore=acorn_clicked):
-                reason = (f"pos {chosen['pos']+1} | SMART score={chosen['score']:.3f} "
-                          f"| G{chosen['min_gen'] if chosen['min_gen'] is not None else '∅'} "
-                          f"| likes={chosen['likes']}")
-                self._click_normal_with_retry(pos_buttons[chosen["pos"]]["id"], channel_id, guild_id, m, reason)
-            return
-
-        # ---------- NORMAL MODE ----------
-        def select_by_priority(pool, p1, p2, p3):
-            def apply(pref, candidates):
-                if not candidates:
-                    return []
-                if pref == "high_likes":
-                    mx = max([c["likes"] for c in candidates])
-                    return [c for c in candidates if c["likes"] == mx]
-                elif pref == "low_gen":
-                    gen_vals = [c["min_gen"] for c in candidates if c["min_gen"] is not None]
-                    if not gen_vals:
-                        return []
-                    mn = min(gen_vals)
-                    return [c for c in candidates if c["min_gen"] == mn]
-                elif pref == "no_gen":
-                    return [c for c in candidates if (c["min_gen"] is None or not c["has_gen"])]
-                elif pref == "series":
-                    ser = series_filter(candidates)
-                    return ser if ser else []
-                else:
-                    return candidates
-
-            logging.info(f"🎯 NORMAL priorities: {p1} → {p2} → {p3}")
-
-            pool1 = apply(p1, pool)
-            if pool1:
-                logging.info(f"  • P1({p1}) matched {len(pool1)} -> {[(c['pos']+1) for c in pool1]}")
-                return tiebreak(pool1)
-            logging.info(f"  • P1({p1}) no match, trying P2 …")
-
-            pool2 = apply(p2, pool)
-            if pool2:
-                logging.info(f"  • P2({p2}) matched {len(pool2)} -> {[(c['pos']+1) for c in pool2]}")
-                return tiebreak(pool2)
-            logging.info(f"  • P2({p2}) no match, trying P3 …")
-
-            pool3 = apply(p3, pool)
-            if pool3:
-                logging.info(f"  • P3({p3}) matched {len(pool3)} -> {[(c['pos']+1) for c in pool3]}")
-                return tiebreak(pool3)
-
-            logging.info("  • No priority matched; applying deterministic fallback.")
-            return tiebreak(pool)
-
-        chosen = select_by_priority(normals, self.NORM_P1, self.NORM_P2, self.NORM_P3)
-        if not blocked(ignore=acorn_clicked):
-            reason = (f"pos {chosen['pos']+1} | NORMAL ({self.NORM_P1} > {self.NORM_P2} > {self.NORM_P3}) "
-                      f"| G{chosen['min_gen'] if chosen['min_gen'] is not None else '∅'} "
-                      f"| likes={chosen['likes']}")
-            self._click_normal_with_retry(pos_buttons[chosen["pos"]]["id"], channel_id, guild_id, m, reason)
-
-    # --------- Gateway handlers ---------
-    def _install_handlers(self):
-        @self.bot.gateway.command
-        def on_any_event(resp):
-            try:
-                if hasattr(resp, "raw") and resp.raw.get("op") == 0:  # Dispatch
-                    self.last_gateway_event = time.time()
-            except Exception:
-                pass
-
-        @self.bot.gateway.command
-        def on_ready(resp):
-            if not resp.event.ready: return
-            user = resp.parsed.auto().get("user")
-            if user:
-                logging.info(f"✅ Gateway READY as {user['username']}#{user['discriminator']}")
-            self.gateway_ready = True
-            self.last_gateway_event = time.time()
-            self.gateway_start_time = 0.0
-            if not self.sent_initial_sd:
-                for _ in range(6):
-                    try:
-                        if self.bot and self.bot.gateway.session_id:
-                            self.bot.sendMessage(self.CHANNEL_ID, "sd")
-                            self.sent_initial_sd = True
-                            logging.info("📤 Sent 'sd' command.")
-                            break
-                    except Exception:
-                        logging.exception("⚠️ Failed to send initial 'sd'")
-                    time.sleep(0.5)
-
-        @self.bot.gateway.command
-        def on_message(resp):
-            if not hasattr(resp, "raw") or resp.raw.get("t") != "MESSAGE_CREATE":
+        logging.info(f"🎯 NORMAL: {self.P1} > {self.P2} > {self.P3}")
+        for pref in (self.P1, self.P2, self.P3):
+            cand = apply_pref(pref, cands)
+            if cand:
+                ch = tie_break(cand)
+                if not self._blocked(ignore=acorn_clicked):
+                    self._normal_click_with_confirm(pos_btns[ch["pos"]]["id"], channel_id, guild_id, m,
+                                                    f"NORMAL {self.P1}>{self.P2}>{self.P3} | G{ch['min_gen'] if ch['min_gen'] is not None else '∅'} | likes={ch['likes']}")
                 return
-            self.last_gateway_event = time.time()
-            data = resp.raw["d"]
-            m = resp.parsed.auto()
-            author_id = str(data.get("author", {}).get("id"))
-            channel_id = str(data.get("channel_id"))
-            guild_id = str(data.get("guild_id")) if data.get("guild_id") else None
-            content = data.get("content", "")
+        # fallback
+        ch = tie_break(cands)
+        if not self._blocked(ignore=acorn_clicked):
+            self._normal_click_with_confirm(pos_btns[ch["pos"]]["id"], channel_id, guild_id, m,
+                                            f"FALLBACK | G{ch['min_gen'] if ch['min_gen'] is not None else '∅'} | likes={ch['likes']}")
 
-            if author_id != SofiBotManager.SOFI_BOT_ID:
-                return
-            #if self.GUILD_ID and guild_id != self.GUILD_ID:
-             #   return
-
-            # Confirmation detection (either "grabbed" or "fought off")
-            if self.pending_claim.get("triggered"):
-                expected_grab = f"<@{self.pending_claim['user_id']}> **grabbed** the"
-                expected_fight = f"<@{self.pending_claim['user_id']}> fought off"
-                if content.startswith(expected_grab) or content.startswith(expected_fight):
-                    logging.info(f"✅ Claim confirmed: {content[:120]}…")
-                    with self.last_processed_time_lock:
-                        self.last_processed_time = time.time()
-                    self.pending_claim["triggered"] = False
-                    return
-
-            attachments = data.get("attachments", [])
-            components = data.get("components", [])
-            if not attachments or not components:
-                return
-
-            def process_sofi_drop(attachment_url, components, channel_id, guild_id, m):
-                try:
-                    pil_image = pil_from_url_or_none(self.http, attachment_url)
-                    if pil_image is None:  # fetch failed
-                        return
-                    image_received_time = time.time()
-                    self.click_bouquet_then_best_from_image(pil_image, components, image_received_time, channel_id, guild_id, m)
-                except Exception as e:
-                    logging.warning(f"Failed to process image: {e}")
-                    if "NameResolutionError" in str(e) or "getaddrinfo failed" in str(e).lower():
-                        logging.warning("Hint: DNS failed. Try ipconfig /flushdns, netsh winsock reset, or change DNS.")
-
-            for att in attachments:
-                fn = att.get("filename", "")
-                if any(fn.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp")):
-                    t = threading.Thread(target=process_sofi_drop, args=(att.get("url"), components, channel_id, data.get("guild_id"), m), daemon=True)
-                    t.start()
-
-    # --------- Lifecycle ---------
-    def start(self):
-        global READER
-        if self.bot_thread and self.bot_thread.is_alive():
-            logging.info("ℹ️ Bot already running."); return
-
-        # OCR boot
-        logging.info(f"🔎 Initializing EasyOCR (gpu={self.USE_GPU}) …")
-        if READER is None:
-            READER = easyocr.Reader(["en"], gpu=self.USE_GPU, verbose=False)
-            _ = READER.readtext(np.zeros((100, 100, 3), dtype=np.uint8), detail=0)
-
-        # Client
-        self.bot = discum.Client(token=self.TOKEN, log=False)
-        self._install_handlers()
-        self.stop_event.clear()
-        self.pending_claim["user_id"] = self.USER_ID
-        self.bot_identity_logged = False
-        self.sent_initial_sd = False
-        self.gateway_ready = False
-        self.last_gateway_event = 0.0
-        self.gateway_start_time = time.time()
-        self._run_token += 1
-
-        # Threads
-        if not (self.sd_thread and self.sd_thread.is_alive()):
-            self.sd_thread = threading.Thread(target=self.periodic_sd_sender, daemon=True); self.sd_thread.start()
-        if not (self.ka_thread and self.ka_thread.is_alive()):
-            self.ka_thread = threading.Thread(target=self.keep_alive, daemon=True); self.ka_thread.start()
-        if not (self.watchdog_thread and self.watchdog_thread.is_alive()):
-            self.watchdog_thread = threading.Thread(target=self.message_watchdog, daemon=True); self.watchdog_thread.start()
-        if not (self.claim_timeout_thread and self.claim_timeout_thread.is_alive()):
-            self.claim_timeout_thread = threading.Thread(target=self.reset_claim_if_timed_out, daemon=True); self.claim_timeout_thread.start()
-
-        def run_gateway():
-            logging.info("🔌 Connecting to Discord gateway …")
-            try:
-                self.bot.gateway.run(auto_reconnect=True)
-            except Exception as e:
-                logging.critical(f"Failed to connect to Discord gateway: {e}")
-                logging.critical("Check DISCORD_TOKEN, internet, or Discord status.")
-        self.bot_thread = threading.Thread(target=run_gateway, daemon=True); self.bot_thread.start()
-
-    def stop(self, internal=False):
-        logging.info("🛑 Stopping bot …")
-        self.stop_event.set()
-        try:
-            if self.bot and self.bot.gateway:
-                self.bot.gateway.close()
-        except Exception:
-            pass
-        for tname in ("sd_thread", "ka_thread", "watchdog_thread", "claim_timeout_thread"):
-            t = getattr(self, tname, None)
-            if t and t.is_alive():
-                try: t.join(timeout=2.0)
-                except Exception: pass
-                setattr(self, tname, None)
-        self.sd_thread = self.ka_thread = self.watchdog_thread = self.claim_timeout_thread = None
-        self.gateway_ready = False
-        self.gateway_start_time = 0.0
-        # Join gateway thread
-        if self.bot_thread and self.bot_thread.is_alive():
-            try: self.bot_thread.join(timeout=3.0)
-            except Exception: pass
-        self.bot_thread = None
-        logging.info("✅ Bot stopped.")
-        if not internal:
-            logging.info("You can Apply settings and the bot will auto-restart if needed.")
-
-    def save_env(self):
-        data = {
-            "DISCORD_TOKEN": self.TOKEN,
-            "GUILD_ID": self.GUILD_ID,
-            "CHANNEL_ID": self.CHANNEL_ID,
-            "USER_ID": self.USER_ID,
-            "SD_INTERVAL_SEC": str(self.SD_INTERVAL_SEC),
-            "OCR_USE_GPU": "1" if self.USE_GPU else "0",
-            "CLAIM_CONFIRM_TIMEOUT": str(self.CLAIM_CONFIRM_TIMEOUT),
-            "POST_ACORN_NORMAL_DELAY": str(self.POST_ACORN_NORMAL_DELAY),
-            "MODE": self.MODE,  # smart | normal
-            "NORM_P1": self.NORM_P1,
-            "NORM_P2": self.NORM_P2,
-            "NORM_P3": self.NORM_P3,
-            "SERIES_NAME": self.series_preference,
-            "SCORE_BONUS_SERIES": str(self.SCORE_BONUS_SERIES),
-            "SCORE_BONUS_NOGEN": str(self.SCORE_BONUS_NOGEN),
-            "T_LIKE": str(self.T_LIKE),
-            "T_GEN": str(self.T_GEN),
-            "WL_MIN": str(self.WL_MIN),
-            "WL_SPAN": str(self.WL_SPAN),
-            "LIKES_LOG_DAMP": "1" if self.LIKES_LOG_DAMP else "0",
-            "WATCHDOG_TIMEOUT": str(self.WATCHDOG_TIMEOUT),
-            "GATEWAY_READY_TIMEOUT": str(self.GATEWAY_READY_TIMEOUT),
-        }
-        with open(self.cfg_path, "w", encoding="utf-8") as f:
-            for k, v in data.items():
-                f.write(f"{k}={v}\n")
-        logging.info(f"💾 Saved settings to {self.cfg_path}")
-
-# --------------------------
-# Tkinter UI (Auto-start; with Mode & Preferences)
-# --------------------------
-class TextHandler(logging.Handler):
+# ---------------- UI ----------------
+class TextLogHandler(logging.Handler):
     def __init__(self, widget: ScrolledText):
         super().__init__()
         self.widget = widget
         self.formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     def emit(self, record):
         msg = self.format(record) + "\n"
-        level = record.levelno
-        if level >= logging.CRITICAL: tag = "CRITICAL"
-        elif level >= logging.ERROR: tag = "ERROR"
-        elif level >= logging.WARNING: tag = "WARNING"
-        elif level >= logging.INFO: tag = "INFO"
-        else: tag = "DEBUG"
+        tag = ("CRIT" if record.levelno>=logging.CRITICAL else
+               "ERR" if record.levelno>=logging.ERROR else
+               "WARN" if record.levelno>=logging.WARNING else
+               "INFO")
         try:
-            self.widget.after(0, self._append_with_tag, msg, tag)
+            self.widget.after(0, self._append, msg, tag)
         except Exception:
             pass
-    def _append_with_tag(self, msg, tag):
+    def _append(self, msg, tag):
         self.widget.configure(state="normal")
         self.widget.insert(tk.END, msg, tag)
         self.widget.see(tk.END)
         self.widget.configure(state="disabled")
 
-class SofiApp(tk.Tk):
+
+class SofiGUI:
     def __init__(self):
-        super().__init__()
-        self.title("Sofi Farming Bot — Auto Start (Mode & Preferences)")
-        self.geometry("1000x780")
-        self.minsize(920, 660)
-        self._apply_in_progress = False
-        self.manager = SofiBotManager()
+        if HAVE_TTKTHEMES:
+            # Use ThemedTk
+            self.root = ThemedTk(theme="arc")
+        else:
+            # Fallback to normal Tk
+            self.root = tk.Tk()
+
+        self.root.title("Sofi Farming Bot — with Top.gg voter")
+        self.root.geometry("1080x820")
+        self.root.minsize(980, 700)
+
+        self.mgr = SofiBotManager()
         self._build_ui()
         self._wire_logging()
-        self._load_from_manager()
-        # Auto-start immediately
-        self.after(150, self._auto_start)
+        self._load_from_env()
+        self.root.after(150, self._start_now)
 
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        # Bind kill signals
+        signal.signal(signal.SIGINT, self._sig)
+        signal.signal(signal.SIGTERM, self._sig)
 
-    # ---------- UI ----------
+    def run(self):
+        self.root.mainloop()
+
+    # ---- UI build ----
     def _build_ui(self):
+        root = self.root
+
         style = ttk.Style()
         try:
             style.theme_use("aqua")
         except Exception:
             pass
 
-        pad = {"padx": 8, "pady": 6}
+        pad = {"padx":8, "pady":6}
 
         # Connection
-        frm_conn = ttk.LabelFrame(self, text="Connection & Runtime (.env)")
+        frm_conn = ttk.LabelFrame(root, text="Connection & Runtime")
         frm_conn.pack(fill="x", **pad)
 
+        self.var_token = tk.StringVar()
+        self.var_guild = tk.StringVar()
+        self.var_chan  = tk.StringVar()
+        self.var_user  = tk.StringVar()
+        self.var_sd_int= tk.IntVar(value=480)
+
         ttk.Label(frm_conn, text="Discord Token").grid(row=0, column=0, sticky="w")
-        self.var_token = tk.StringVar(value="")
-        self.ent_token = ttk.Entry(frm_conn, textvariable=self.var_token, width=64, show="•")
-        self.ent_token.grid(row=0, column=1, sticky="ew", columnspan=3)
-        self.show_token = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm_conn, text="Show", variable=self.show_token, command=self._toggle_token).grid(row=0, column=4, sticky="w")
+        ent_token = ttk.Entry(frm_conn, textvariable=self.var_token, width=64, show="•")
+        ent_token.grid(row=0, column=1, sticky="ew", columnspan=3)
+        self._show = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm_conn, text="Show", variable=self._show, command=lambda: ent_token.config(show="" if self._show.get() else "•")).grid(row=0, column=4, sticky="w")
 
         ttk.Label(frm_conn, text="Guild ID").grid(row=1, column=0, sticky="w")
-        self.var_guild = tk.StringVar(value="")
-        ttk.Entry(frm_conn, textvariable=self.var_guild, width=26).grid(row=1, column=1, sticky="w")
+        ttk.Entry(frm_conn, textvariable=self.var_guild, width=24).grid(row=1, column=1, sticky="w")
 
         ttk.Label(frm_conn, text="Channel ID").grid(row=1, column=2, sticky="w")
-        self.var_channel = tk.StringVar(value="")
-        ttk.Entry(frm_conn, textvariable=self.var_channel, width=26).grid(row=1, column=3, sticky="w")
+        ttk.Entry(frm_conn, textvariable=self.var_chan, width=24).grid(row=1, column=3, sticky="w")
 
         ttk.Label(frm_conn, text="Your User ID").grid(row=2, column=0, sticky="w")
-        self.var_user = tk.StringVar(value="")
-        ttk.Entry(frm_conn, textvariable=self.var_user, width=26).grid(row=2, column=1, sticky="w")
+        ttk.Entry(frm_conn, textvariable=self.var_user, width=24).grid(row=2, column=1, sticky="w")
 
         ttk.Label(frm_conn, text="'sd' Interval (sec)").grid(row=2, column=2, sticky="w")
-        self.var_interval = tk.IntVar(value=480)
-        ttk.Spinbox(frm_conn, from_=60, to=3600, increment=10, textvariable=self.var_interval, width=10).grid(row=2, column=3, sticky="w")
+        ttk.Spinbox(frm_conn, from_=60, to=3600, increment=10, textvariable=self.var_sd_int, width=10).grid(row=2, column=3, sticky="w")
 
-        self.var_gpu = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm_conn, text="Use GPU for OCR (advanced)", variable=self.var_gpu).grid(row=3, column=1, sticky="w", pady=(2, 8))
-
-        for c in (1, 3):
+        for c in (1,3):
             frm_conn.grid_columnconfigure(c, weight=1)
 
-        # Mode & Preferences
-        frm_prefs = ttk.LabelFrame(self, text="Mode & Preferences")
-        frm_prefs.pack(fill="x", **pad)
+        # Mode
+        frm_mode = ttk.LabelFrame(root, text="Mode & Preferences")
+        frm_mode.pack(fill="x", **pad)
 
-        ttk.Label(frm_prefs, text="Mode").grid(row=0, column=0, sticky="w")
         self.var_mode = tk.StringVar(value="smart")
-        self.cmb_mode = ttk.Combobox(frm_prefs, textvariable=self.var_mode, values=("smart", "normal"), state="readonly", width=12)
+        ttk.Label(frm_mode, text="Mode").grid(row=0, column=0, sticky="w")
+        self.cmb_mode = ttk.Combobox(frm_mode, values=("smart","normal"), textvariable=self.var_mode, state="readonly", width=12)
         self.cmb_mode.grid(row=0, column=1, sticky="w", padx=4)
-        self.cmb_mode.bind("<<ComboboxSelected>>", lambda e: self._toggle_normal_controls())
 
-        ttk.Label(frm_prefs, text="Series (optional)").grid(row=0, column=2, sticky="w")
-        self.var_series = tk.StringVar(value="")
-        ttk.Entry(frm_prefs, textvariable=self.var_series, width=28).grid(row=0, column=3, columnspan=2, sticky="w", padx=4)
+        ttk.Label(frm_mode, text="Series (optional)").grid(row=0, column=2, sticky="w")
+        self.var_series = tk.StringVar()
+        ttk.Entry(frm_mode, textvariable=self.var_series, width=28).grid(row=0, column=3, sticky="w", padx=4)
 
-        opts = ("high_likes", "low_gen", "no_gen", "series")
-        ttk.Label(frm_prefs, text="Normal priority 1").grid(row=1, column=0, sticky="w")
+        opts = ("high_likes","low_gen","no_gen","series")
         self.var_p1 = tk.StringVar(value="high_likes")
-        self.cmb_p1 = ttk.Combobox(frm_prefs, textvariable=self.var_p1, values=opts, state="readonly", width=12)
-        self.cmb_p1.grid(row=1, column=1, sticky="w", padx=4)
-
-        ttk.Label(frm_prefs, text="Normal priority 2").grid(row=1, column=2, sticky="w")
         self.var_p2 = tk.StringVar(value="low_gen")
-        self.cmb_p2 = ttk.Combobox(frm_prefs, textvariable=self.var_p2, values=opts, state="readonly", width=12)
-        self.cmb_p2.grid(row=1, column=3, sticky="w", padx=4)
-
-        ttk.Label(frm_prefs, text="Normal priority 3").grid(row=1, column=4, sticky="w")
         self.var_p3 = tk.StringVar(value="series")
-        self.cmb_p3 = ttk.Combobox(frm_prefs, textvariable=self.var_p3, values=opts, state="readonly", width=12)
-        self.cmb_p3.grid(row=1, column=5, sticky="w")
+        ttk.Label(frm_mode, text="Normal P1").grid(row=1, column=0, sticky="w")
+        ttk.Combobox(frm_mode, values=opts, textvariable=self.var_p1, state="readonly", width=12).grid(row=1, column=1, sticky="w", padx=4)
+        ttk.Label(frm_mode, text="Normal P2").grid(row=1, column=2, sticky="w")
+        ttk.Combobox(frm_mode, values=opts, textvariable=self.var_p2, state="readonly", width=12).grid(row=1, column=3, sticky="w")
+        ttk.Label(frm_mode, text="Normal P3").grid(row=1, column=4, sticky="w")
+        ttk.Combobox(frm_mode, values=opts, textvariable=self.var_p3, state="readonly", width=12).grid(row=1, column=5, sticky="w")
 
-        # Buttons row
-        frm_btns = ttk.Frame(self); frm_btns.pack(fill="x", **pad)
-        self.btn_apply = ttk.Button(frm_btns, text="Reboot", command=self._apply_live)
-        self.btn_apply.pack(side="left", padx=4)
-        ttk.Button(frm_btns, text="Save .env", command=self._save_env).pack(side="left", padx=8)
-        self.btn_stop  = ttk.Button(frm_btns, text="Stop Bot", command=self._stop)
-        self.btn_stop.pack(side="left", padx=8)
-        ttk.Button(frm_btns, text="Clear Logs", command=self._clear_logs).pack(side="left", padx=8)
-        ttk.Button(frm_btns, text="Copy Logs", command=self._copy_logs).pack(side="left", padx=8)
-        ttk.Button(frm_btns, text="Open Log Folder", command=self._open_log_folder).pack(side="left", padx=8)
+        # Voting
+        frm_vote = ttk.LabelFrame(root, text="Top.gg Vote (every 12h)")
+        frm_vote.pack(fill="x", **pad)
 
-        # Status + Logs
-        frm_status = ttk.Frame(self); frm_status.pack(fill="x", **pad)
-        self.lbl_status = ttk.Label(frm_status, text="Status: Booting …", foreground="#1d4ed8"); self.lbl_status.pack(side="left")
+        self.var_vote_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm_vote, text="Enable Top.gg Vote", variable=self.var_vote_enabled).grid(row=0, column=0, sticky="w")
 
-        frm_log = ttk.LabelFrame(self, text="Logs"); frm_log.pack(fill="both", expand=True, **pad)
-        self.txt_log = ScrolledText(frm_log, height=24, state="disabled", wrap="none"); self.txt_log.pack(fill="both", expand=True, padx=6, pady=6)
-        # colors
-        for name, color in [("DEBUG","#6b7280"),("INFO","#2563eb"),("WARNING","#d97706"),("ERROR","#dc2626"),("CRITICAL","#ffffff")]:
-            if name == "CRITICAL":
-                self.txt_log.tag_config(name, foreground="#ffffff", background="#b91c1c")
-            else:
-                self.txt_log.tag_config(name, foreground=color)
+        ttk.Label(frm_vote, text="Chrome Profile Dir").grid(row=0, column=1, sticky="e")
+        self.var_prof_dir = tk.StringVar()
+        ttk.Entry(frm_vote, textvariable=self.var_prof_dir, width=40).grid(row=0, column=2, sticky="w")
 
-        self._toggle_normal_controls()
+        ttk.Label(frm_vote, text="Profile Name").grid(row=1, column=1, sticky="e")
+        self.var_prof_name = tk.StringVar()
+        ttk.Entry(frm_vote, textvariable=self.var_prof_name, width=20).grid(row=1, column=2, sticky="w")
 
-    def _toggle_token(self):
-        self.ent_token.configure(show="" if self.show_token.get() else "•")
+        ttk.Label(frm_vote, text="Chrome Binary").grid(row=2, column=1, sticky="e")
+        self.var_chrome_bin = tk.StringVar()
+        ttk.Entry(frm_vote, textvariable=self.var_chrome_bin, width=40).grid(row=2, column=2, sticky="w")
 
-    def _toggle_normal_controls(self):
-        normal = self.var_mode.get() == "normal"
-        state = "readonly" if normal else "disabled"
-        for cmb in (self.cmb_p1, self.cmb_p2, self.cmb_p3):
-            cmb.configure(state=state)
+        self.var_vote_url = tk.StringVar(value="https://top.gg/bot/853629533855809596/vote")
+        ttk.Label(frm_vote, text="Vote URL").grid(row=3, column=1, sticky="e")
+        ttk.Entry(frm_vote, textvariable=self.var_vote_url, width=40).grid(row=3, column=2, sticky="w")
+
+        self.var_vote_hrs = tk.DoubleVar(value=12.0)
+        ttk.Label(frm_vote, text="Interval (hours)").grid(row=4, column=1, sticky="e")
+        ttk.Spinbox(frm_vote, from_=1, to=24, increment=0.5, textvariable=self.var_vote_hrs, width=10).grid(row=4, column=2, sticky="w")
+
+        self.var_vote_jitter = tk.DoubleVar(value=7.0)
+        ttk.Label(frm_vote, text="Jitter (min)").grid(row=4, column=3, sticky="e")
+        ttk.Spinbox(frm_vote, from_=0, to=30, increment=1.0, textvariable=self.var_vote_jitter, width=10).grid(row=4, column=4, sticky="w")
+
+        self.lbl_next_vote = ttk.Label(frm_vote, text="Next vote: —")
+        self.lbl_next_vote.grid(row=0, column=3, columnspan=2, sticky="w")
+
+        ttk.Button(frm_vote, text="Vote Now (test)", command=self._open_voter_chrome).grid(row=1, column=3, sticky="w", padx=4)
+
+        for c in (2,):
+            frm_vote.grid_columnconfigure(c, weight=1)
+
+        # Controls
+        frm_ctl = ttk.Frame(root); frm_ctl.pack(fill="x", **pad)
+        ttk.Button(frm_ctl, text="Apply (Reboot)", command=self._apply).pack(side="left", padx=6)
+        ttk.Button(frm_ctl, text="Save .env", command=self._save_env).pack(side="left", padx=6)
+        ttk.Button(frm_ctl, text="Stop", command=self._stop).pack(side="left", padx=6)
+        ttk.Button(frm_ctl, text="Clear Logs", command=self._clear).pack(side="left", padx=6)
+        ttk.Button(frm_ctl, text="Copy Logs", command=self._copy).pack(side="left", padx=6)
+
+        # Logs
+        frm_log = ttk.LabelFrame(root, text="Logs")
+        frm_log.pack(fill="both", expand=True, **pad)
+        self.txt = ScrolledText(frm_log, height=18)
+        self.txt.pack(fill="both", expand=True)
+        # tags
+        self.txt.tag_config("INFO", foreground="#e0e0e0")
+        self.txt.tag_config("WARN", foreground="#ffcc00")
+        self.txt.tag_config("ERR",  foreground="#ff6666")
+        self.txt.tag_config("CRIT", foreground="#ff3333")
+        self.txt.config(bg="#111", fg="#e0e0e0", insertbackground="#e0e0e0")
+
+        # small timer for next vote label
+        self.root.after(1000, self._tick_vote_label)
+
 
     def _wire_logging(self):
-        handler = TextHandler(self.txt_log)
-        handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-        logging.getLogger().addHandler(handler)
+        lh = TextLogHandler(self.txt)
+        logging.getLogger().addHandler(lh)
 
-    def _load_from_manager(self):
-        m = self.manager
-        # connection
-        self.var_token.set(m.TOKEN)
-        self.var_guild.set(m.GUILD_ID)
-        self.var_channel.set(m.CHANNEL_ID)
-        self.var_user.set(m.USER_ID)
-        self.var_interval.set(m.SD_INTERVAL_SEC)
-        self.var_gpu.set(bool(m.USE_GPU))
-        # prefs
-        self.var_mode.set(m.MODE)
-        self.var_series.set(m.series_preference or "")
-        self.var_p1.set(m.NORM_P1); self.var_p2.set(m.NORM_P2); self.var_p3.set(m.NORM_P3)
-        self._toggle_normal_controls()
+    # ---- env I/O ----
+    def _load_from_env(self):
+        self.var_token.set(self.mgr.TOKEN)
+        self.var_guild.set(self.mgr.GUILD_ID)
+        self.var_chan.set(self.mgr.CHANNEL)
+        self.var_user.set(self.mgr.USER_ID)
+        self.var_sd_int.set(self.mgr.SD_INTERVAL)
 
-    def _validate_priority_order(self):
-        # Ensure unique p1/p2/p3 by auto-fixing duplicates
-        vals = [self.var_p1.get(), self.var_p2.get(), self.var_p3.get()]
-        allowed = ["high_likes", "low_gen", "no_gen", "series"]
-        seen = []
-        for i, v in enumerate(vals):
-            if v not in allowed or v in seen:
-                for a in allowed:
-                    if a not in seen:
-                        vals[i] = a; break
-            seen.append(vals[i])
-        self.var_p1.set(vals[0]); self.var_p2.set(vals[1]); self.var_p3.set(vals[2])
+        self.var_mode.set(self.mgr.MODE)
+        self.var_series.set(self.mgr.SERIES)
+        self.var_p1.set(self.mgr.P1); self.var_p2.set(self.mgr.P2); self.var_p3.set(self.mgr.P3)
 
-    def _apply_to_manager(self):
-        self._validate_priority_order()
-        m = self.manager
+        self.var_vote_enabled.set(self.mgr.VOTE_ENABLED)
+        self.var_prof_dir.set(self.mgr.VOTE_PROFILE_DIR)
+        self.var_prof_name.set(self.mgr.VOTE_PROFILE_NAME)
+        self.var_chrome_bin.set(self.mgr.VOTE_CHROME_BIN)
+        self.var_vote_url.set(self.mgr.VOTE_URL)
+        self.var_vote_hrs.set(self.mgr.VOTE_INTERVAL_H)
+        self.var_vote_jitter.set(self.mgr.VOTE_JITTER_MIN)
 
-        # Detect changes that require reboot
-        needs_reboot = False
-        fields = {}
+    def _save_env(self):
+        data = {
+            "DISCORD_TOKEN": self.var_token.get(),
+            "GUILD_ID": self.var_guild.get(),
+            "CHANNEL_ID": self.var_chan.get(),
+            "USER_ID": self.var_user.get(),
+            "SD_INTERVAL_SEC": str(self.var_sd_int.get()),
+            "MODE": self.var_mode.get(),
+            "NORM_P1": self.var_p1.get(),
+            "NORM_P2": self.var_p2.get(),
+            "NORM_P3": self.var_p3.get(),
+            "SERIES_NAME": self.var_series.get(),
+            "T_LIKE": "10", "T_GEN":"40", "WL_MIN":"0.15", "WL_SPAN":"0.70", "LIKES_LOG_DAMP":"1",
+            "TOPGG_VOTE_ENABLED": "1" if self.var_vote_enabled.get() else "0",
+            "TOPGG_VOTE_URL": self.var_vote_url.get(),
+            "TOPGG_CHROME_PROFILE_DIR": self.var_prof_dir.get(),
+            "TOPGG_CHROME_PROFILE_NAME": self.var_prof_name.get(),
+            "TOPGG_CHROME_BINARY": self.var_chrome_bin.get(),
+            "TOPGG_VOTE_INTERVAL_HOURS": str(self.var_vote_hrs.get()),
+            "TOPGG_VOTE_JITTER_MINUTES": str(self.var_vote_jitter.get()),
+            "WATCHDOG_TIMEOUT": "600",
+            "GATEWAY_READY_TIMEOUT": "120",
+            "CLAIM_CONFIRM_TIMEOUT": "15",
+            "POST_ACORN_NORMAL_DELAY": "0.8",
+        }
+        with open(self.mgr.env_path, "w", encoding="utf-8") as f:
+            for k,v in data.items():
+                f.write(f"{k}={v}\n")
+        logging.info(f"💾 Saved .env to {self.mgr.env_path}")
 
-        new_TOKEN = self.var_token.get().strip()
-        new_GUILD = self.var_guild.get().strip()
-        new_CHAN  = self.var_channel.get().strip()
-        new_USER  = self.var_user.get().strip()
-        new_GPU   = bool(self.var_gpu.get())
-        new_INT   = int(self.var_interval.get())
+    # ---- controls ----
+    def _apply(self):
+        self._save_env()
+        # propagate to manager
+        self.mgr.__init__(self.mgr.env_path)
+        self.mgr.reboot("Apply settings")
 
-        if new_TOKEN != m.TOKEN: fields["TOKEN"] = (m.TOKEN, new_TOKEN); needs_reboot = True
-        if new_GUILD != m.GUILD_ID: fields["GUILD_ID"] = (m.GUILD_ID, new_GUILD); needs_reboot = True
-        if new_CHAN  != m.CHANNEL_ID: fields["CHANNEL_ID"] = (m.CHANNEL_ID, new_CHAN); needs_reboot = True
-        if new_USER  != m.USER_ID: fields["USER_ID"] = (m.USER_ID, new_USER); needs_reboot = True
-        if new_GPU   != m.USE_GPU: fields["USE_GPU"] = (m.USE_GPU, new_GPU); needs_reboot = True
-
-        # Apply
-        m.TOKEN = new_TOKEN
-        m.GUILD_ID = new_GUILD
-        m.CHANNEL_ID = new_CHAN
-        m.USER_ID = new_USER
-        m.USE_GPU = new_GPU
-        m.SD_INTERVAL_SEC = new_INT
-
-        # Preferences (live-applied, no reboot needed)
-        old_mode = m.MODE
-        m.MODE = (self.var_mode.get() or "smart").strip().lower()
-        m.series_preference = self.var_series.get().strip()
-        m.NORM_P1 = (self.var_p1.get() or "high_likes").strip().lower()
-        m.NORM_P2 = (self.var_p2.get() or "low_gen").strip().lower()
-        m.NORM_P3 = (self.var_p3.get() or "series").strip().lower()
-        m._normalize_normal_priorities()
-
-        if old_mode != m.MODE:
-            logging.info(f"🔁 Switched mode: {old_mode} → {m.MODE} (live)")
-
-        return needs_reboot, fields
-
-    def _auto_start(self):
-        try:
-            self.manager.start()
-            self.lbl_status.configure(text="Status: Running", foreground="#16a34a")
-        except Exception:
-            logging.exception("Failed to auto-start bot")
-            self.lbl_status.configure(text="Status: Failed to start", foreground="#dc2626")
+    def _start_now(self):
+        self.mgr.start()
 
     def _stop(self):
+        self.mgr.stop()
+
+    def _clear(self):
+        self.txt.configure(state="normal")
+        self.txt.delete("1.0", tk.END)
+        self.txt.configure(state="disabled")
+
+    def _copy(self):
         try:
-            self.manager.stop()
-            self.lbl_status.configure(text="Status: Stopped", foreground="#dc2626")
+            txt = self.txt.get("1.0", tk.END)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(txt)
+            logging.info("📋 Logs copied to clipboard.")
         except Exception:
             pass
 
-    def _apply_live(self):
-        if self._apply_in_progress:
+    def _open_voter_chrome(self):
+        prof_dir = self.var_prof_dir.get().strip()
+        prof_name = self.var_prof_name.get().strip() or "Default"
+        chrome = self.var_chrome_bin.get().strip() or r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        if not prof_dir:
+            messagebox.showwarning("Chrome", "Set Chrome Profile Dir first."); return
+        try:
+            import subprocess
+            subprocess.Popen([chrome,
+                            f"--remote-debugging-port=9222",
+                            f"--user-data-dir={prof_dir}",
+                            f"--profile-directory={prof_name}"])
+            logging.info("[vote] Launched voter Chrome at 127.0.0.1:9222.")
+        except Exception as e:
+            logging.error(f"[vote] Failed to launch Chrome: {e}")
+    def _vote_now(self):
+        if not HAVE_SELENIUM:
+            messagebox.showwarning("Vote", "Selenium not installed.")
             return
-        self._apply_in_progress = True
-        try:
-            needs_reboot, fields = self._apply_to_manager()
-            self.manager.save_env()
-            changed = ", ".join([k for k in fields.keys()])
-            logging.info(f"🔄 Applying connection changes ({changed}) → auto-restart")
-            self.manager.reboot_bot("Settings changed that require reconnect")
+        if not self.var_vote_enabled.get():
+            messagebox.showinfo("Vote", "Enable voting first.")
+            return
+        # one-off vote in a short thread that respects voting guards
+        def do():
+            got = self.mgr._voting_lock.acquire(False)
+            if not got:
+                logging.info("[vote] Already in progress.")
+                return
+            self.mgr.in_voting.set()
+            try:
+                voter = TopGGVoter(
+                    self.var_vote_url.get(),
+                    self.var_prof_dir.get(),
+                    self.var_prof_name.get(),
+                    self.var_chrome_bin.get(),
+                    wait_secs=10,
+                )
+                ok = voter.vote_once()
+                # do not change schedule; this is a manual test
+                logging.info(f"[vote] Manual vote {'OK' if ok else 'FAILED'}.")
+            finally:
+                self.mgr.in_voting.clear()
+                try: self.mgr._voting_lock.release()
+                except Exception: pass
+        threading.Thread(target=do, daemon=True).start()
 
-        finally:
-            self._apply_in_progress = False
-
-    def _save_env(self):
-        # Save without forcing restart
-        try:
-            # Keep current manager values (already synced on last Apply)
-            self.manager.save_env()
-            messagebox.showinfo("Saved", f"Settings saved to {self.manager.cfg_path}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to save .env: {e}")
-
-    def _clear_logs(self):
-        self.txt_log.configure(state="normal")
-        self.txt_log.delete("1.0", tk.END)
-        self.txt_log.configure(state="disabled")
-
-    def _copy_logs(self):
-        try:
-            text = self.txt_log.get("1.0", tk.END)
-            self.clipboard_clear()
-            self.clipboard_append(text)
-            messagebox.showinfo("Copied", "Logs copied to clipboard.")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to copy logs: {e}")
-
-    def _open_log_folder(self):
-        folder = os.getcwd()
-        if sys.platform.startswith("win"):
-            os.startfile(folder)
+    def _tick_vote_label(self):
+        if self.mgr.VOTE_ENABLED and self.mgr.next_vote_at>0:
+            rem = int(self.mgr.next_vote_at - time.time())
+            if rem < 0: rem = 0
+            hh = rem//3600; mm = (rem%3600)//60
+            self.lbl_next_vote.config(text=f"Next vote in: {hh}h {mm}m")
         else:
-            messagebox.showinfo("Folder", f"Logs are in: {folder}")
+            self.lbl_next_vote.config(text="Next vote: —")
+            self.root.after(1000, self._tick_vote_label)
 
-    def _signal_handler(self, *_):
-        self._stop()
-        self.destroy()
+
+    def _sig(self, *args):
+        try:
+            self.mgr.stop()
+        finally:
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
-    app = SofiApp()
-    app.mainloop()
+    app = SofiGUI()
+    app.run()
