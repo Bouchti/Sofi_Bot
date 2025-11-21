@@ -550,6 +550,8 @@ class SofiBotManager:
         # watchdog
         self.WATCHDOG_TIMEOUT = int(os.getenv("WATCHDOG_TIMEOUT","600"))
         self.GATEWAY_READY_TIMEOUT = int(os.getenv("GATEWAY_READY_TIMEOUT","120"))
+        # if we keep sending 'sd' but never see a Sofi drop, reboot after this many seconds
+        self.SOFI_STALL_TIMEOUT = int(os.getenv("SOFI_STALL_TIMEOUT","900"))
         self.watchdog_grace_until = 0.0
         # threads
         self.t_gateway = None
@@ -565,6 +567,10 @@ class SofiBotManager:
         self._last_reboot = 0.0
         self.REBOOT_MIN_INTERVAL = 20.0
         self.last_sd_ts = 0.0
+        # Track last time we *saw* a Sofi drop fully (with components+image)
+        self.last_sofi_drop_ts = 0.0
+        # Track last time we *sent* an 'sd' command
+        self.last_sd_sent_ts = 0.0
         self.MIN_SD_SGR_GAP = float(os.getenv("SOFI_MIN_SD_SGR_GAP", "6.0"))   # seconds
         self.STARTUP_SD_DELAY  = float(os.getenv("SOFI_STARTUP_SD_DELAY", "1.0"))
 
@@ -646,21 +652,28 @@ class SofiBotManager:
     def _sd_loop(self):
      while not self.stop_evt.is_set():
         # If gateway not ready, wait a hair and retry
-        if not self.gateway_ready:
+        if not (self.gateway_ready):
+            logging.info("📤 waiting for gateway ready")
             self.stop_evt.wait(1.0)
             continue
 
         # Schedule bootstrap if not set
         if self.next_sd_at <= 0:
             self.next_sd_at = time.time() + 1.0
-
+        ready = (self.gateway_ready and self.bot and getattr(self.bot.gateway, "session_id", None))    
         now = time.time()
         if now >= self.next_sd_at:
             try:
-                self.bot.sendMessage(self.CHANNEL, "sd")
-                logging.info("📤 drop 'sd' (sofi)")
-                self.last_sd_ts = time.time()
-                # Treat our own sd as activity to keep watchdog calm
+                if ready :
+                    self.bot.sendMessage(self.CHANNEL, "sd")
+                    logging.info("📤 drop 'sd' (sofi)")
+                    now_ts = time.time()
+                    self.last_sd_ts = now_ts
+                    self.last_sd_sent_ts = now_ts
+                else:
+                    self.reboot("gateway not ready before sending Sd command")
+                    return
+                    # Treat our own sd as activity to keep watchdog calm
             except Exception as e:
                 logging.warning(f"sd send error: {e}")
 
@@ -672,36 +685,53 @@ class SofiBotManager:
         self.stop_evt.wait(0.5)
 
     def _watchdog_loop(self):
-        logging.info("[watchdog] Started")
         while not self.stop_evt.is_set():
-            now = time.time()
-
-            # 1) If we have a gateway thread and it died, reboot immediately
-            t = getattr(self, "t_gateway", None)
-            if t is not None and not t.is_alive():
-                logging.error("🔄 REBOOT — gateway thread died")
+            time.sleep(3)
+            # 0) Critical threads must be alive
+            tgw = self.t_gateway
+            
+            if tgw is not None and not tgw.is_alive():
                 self.reboot("gateway thread died")
                 return
 
-            # 2) Respect grace period (startup, vote, etc.)
-            if now < self.watchdog_grace_until:
-                self.stop_evt.wait(5.0)
+            tsd = self.t_sd
+            if tsd is not None and not tsd.is_alive():
+                self.reboot("sd loop thread died")
+                return
+            
+            # global grace window
+            if time.time() < self.watchdog_grace_until:
                 continue
 
-            # 3) No gateway events for too long? Reboot.
-            last = self.last_dispatch or 0.0
-            if self.gateway_ready and last:
-                delta = now - last
-                if delta > self.WATCHDOG_TIMEOUT:
-                    logging.error(
-                        f"🔄 REBOOT — no gateway events for {int(delta)}s "
-                        f"(timeout={self.WATCHDOG_TIMEOUT}s)"
-                    )
-                    self.reboot("no gateway events")
+            # skip *entirely* while voting
+            if self.in_voting.is_set():
+                continue
+
+            # also skip READY timeout while voting just finished but READY not yet set
+            if (not self.gateway_ready) and (time.time() < self.watchdog_grace_until):
+                continue
+
+            # READY timeout
+            if (not self.gateway_ready) and self.gateway_connect_started:
+                if time.time() - self.gateway_connect_started > self.GATEWAY_READY_TIMEOUT:
+                    self.reboot("never reached READY")
                     return
 
-            # 4) Sleep a bit before next check
-            self.stop_evt.wait(10.0)
+            # no events for too long
+            last = self.last_dispatch or 0.0
+            now  = time.time()
+            if last and (now - last) > self.WATCHDOG_TIMEOUT:
+                self.reboot("no gateway events")
+                return
+
+            # Sofi stall: we keep sending 'sd' but we never see a Sofi drop
+            if self.last_sd_sent_ts:
+                # if we have never seen a drop OR the last drop is older than the last 'sd'
+                if (not self.last_sofi_drop_ts) or (self.last_sofi_drop_ts < self.last_sd_sent_ts):
+                    if (now - self.last_sd_sent_ts) > self.SOFI_STALL_TIMEOUT:
+                        self.reboot("sd sent but no Sofi drop seen")
+                        return
+
 
     def _claim_timeout_loop(self):
         while not self.stop_evt.is_set():
@@ -788,6 +818,10 @@ class SofiBotManager:
             comps      = d.get("components", []) or []
             atts       = d.get("attachments", []) or []
             embeds     = d.get("embeds", []) or []
+            logging.info(
+                f"[sofi-debug] ch={channel_id} comps={len(comps)} "
+                f"atts={len(atts)} embeds={len(embeds)} content={content[:80]!r}"
+            )
                 # confirmation
             if self.pending_claim["triggered"]:
                 uid = self.pending_claim["user_id"]
@@ -840,6 +874,8 @@ class SofiBotManager:
             # Require buttons + at least one image URL
             if not comps or not img_urls:
                 return
+            # Mark that we *saw* a Sofi drop with components+image
+            self.last_sofi_drop_ts = time.time()
 
             logging.info(f"🎴 Sofi drop seen: comps={len(comps)} imgs={len(img_urls)}")
 
