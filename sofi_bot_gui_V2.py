@@ -81,150 +81,6 @@ def pil_from_url(s: requests.Session, url: str, timeout=15.0) -> Optional[Image.
 
 # ---------------- OCR (global) ----------------
 READER = None
-# ---------- Elite detector (copied from sofi_bot_gui) ----------
-ELITE_CFG = dict(
-    ring_ratio=0.045,
-    edge_margin=0.05,
-    sat_min=45,
-    val_min=60,
-    hue_bins=36,
-    edge_nonzero_bins_min=8,
-    edge_peak_max=0.55,
-    edge_cstd_min=40.0,
-    edge_count_min=120,
-)
-
-def _segment_card_mask(bgr):
-    h, w = bgr.shape[:2]
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 40, 120)
-    th = cv2.adaptiveThreshold(
-        blur,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        41,
-        -5,
-    )
-    mix = cv2.bitwise_or(th, edges)
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    mix = cv2.morphologyEx(mix, cv2.MORPH_CLOSE, k, iterations=2)
-    mix = cv2.morphologyEx(mix, cv2.MORPH_OPEN, k, iterations=1)
-    cnts, _ = cv2.findContours(mix, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    mask = np.zeros((h, w), np.uint8)
-    if not cnts:
-        return mask
-    hull = cv2.convexHull(max(cnts, key=cv2.contourArea))
-    cv2.drawContours(mask, [hull], -1, 255, -1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
-    return mask
-
-def _make_frame_strips(raw, bottom_exclude=0.22, inset_ratio=0.012, thick_ratio=0.032):
-    h, w = raw.shape[:2]
-    ys, xs = np.where(raw > 0)
-    if xs.size == 0:
-        return np.zeros_like(raw), {}
-    x0, x1 = int(xs.min()), int(xs.max())
-    y0, y1 = int(ys.min()), int(ys.max())
-    cw, ch = (x1 - x0 + 1), (y1 - y0 + 1)
-    inset = max(2, int(round(min(cw, ch) * inset_ratio)))
-    thick = max(2, int(round(min(cw, ch) * thick_ratio)))
-    ycap = y0 + int(round((1.0 - bottom_exclude) * ch))
-
-    def clamp(a, lo, hi):
-        return max(lo, min(hi, a))
-
-    top = (
-        clamp(x0 + inset, 0, w - 1),
-        clamp(y0 + inset, 0, h - 1),
-        clamp(x1 - inset - (x0 + inset), 0, w - 1),
-        clamp((y0 + inset + thick) - (y0 + inset), 0, h - 1),
-    )
-    left = (
-        clamp(x0 + inset, 0, w - 1),
-        clamp(y0 + inset, 0, h - 1),
-        clamp((x0 + inset + thick) - (x0 + inset), 0, w - 1),
-        clamp((ycap - inset) - (y0 + inset), 0, h - 1),
-    )
-    right = (
-        clamp(x1 - inset - thick + 1, 0, w - 1),
-        clamp(y0 + inset, 0, h - 1),
-        clamp(thick, 0, w - 1),
-        clamp((ycap - inset) - (y0 + inset), 0, h - 1),
-    )
-    union = np.zeros_like(raw, np.uint8)
-    for (x, y, ww, hh) in (top, left, right):
-        if ww > 1 and hh > 1:
-            union[y : y + hh, x : x + ww] = 255
-    return union, {"top": top, "left": left, "right": right}
-
-def _edge_metrics(Hdeg, S, V, h, w, side, cfg):
-    thick_x = max(2, int(w * cfg["ring_ratio"]))
-    thick_y = max(2, int(h * cfg["ring_ratio"]))
-    mx = max(1, int(w * cfg["edge_margin"]))
-    my = max(1, int(h * cfg["edge_margin"]))
-
-    if side == "top":
-        rr, cc = slice(0, thick_y), slice(mx, w - mx)
-    elif side == "bot":
-        rr, cc = slice(h - thick_y, h), slice(mx, w - mx)
-    elif side == "left":
-        rr, cc = slice(my, h - my), slice(0, thick_x)
-    else:
-        rr, cc = slice(my, h - my), slice(w - thick_x, w)
-
-    m = (S[rr, cc] >= cfg["sat_min"]) & (V[rr, cc] >= cfg["val_min"])
-    hue = Hdeg[rr, cc][m].astype(np.float32)
-    if hue.size == 0:
-        return dict(ok=False, nonzero=0, peak=1.0, cstd=0.0, n=0)
-
-    hist, _ = np.histogram(hue, bins=cfg["hue_bins"], range=(0, 360))
-    total = float(hist.sum())
-    peak = float(hist.max() / max(1.0, total))
-    nonzero = int((hist > 0).sum())
-
-    ang = np.deg2rad(hue)
-    s, c = np.sin(ang).sum(), np.cos(ang).sum()
-    R = np.sqrt(s * s + c * c) / max(1.0, hue.size)
-    R = float(np.clip(R, 1e-6, 0.999999))
-    cstd = float(np.degrees(np.sqrt(-2.0 * np.log(R))))
-
-    ok = (
-        hue.size >= cfg["edge_count_min"]
-        and nonzero >= cfg["edge_nonzero_bins_min"]
-        and peak <= cfg["edge_peak_max"]
-        and cstd >= cfg["edge_cstd_min"]
-    )
-    return dict(ok=ok, nonzero=nonzero, peak=peak, cstd=cstd, n=int(hue.size))
-
-def is_elite(bgr):
-    """Return True if the card frame looks like an elite (colored ring) card."""
-    if bgr is None or bgr.size == 0:
-        return False
-
-    raw = _segment_card_mask(bgr)
-    ring, _ = _make_frame_strips(raw, bottom_exclude=0.22)
-    if ring.sum() == 0:
-        return False
-
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    Hdeg = hsv[..., 0].astype(np.float32) * 2.0
-    S = hsv[..., 1]
-    V = hsv[..., 2]
-
-    h, w = bgr.shape[:2]
-    mtop = _edge_metrics(Hdeg, S, V, h, w, "top", ELITE_CFG)
-    mbot = _edge_metrics(Hdeg, S, V, h, w, "bot", ELITE_CFG)
-    mlef = _edge_metrics(Hdeg, S, V, h, w, "left", ELITE_CFG)
-    mrig = _edge_metrics(Hdeg, S, V, h, w, "right", ELITE_CFG)
-
-    okc = sum([mtop["ok"], mbot["ok"], mlef["ok"], mrig["ok"]])
-    if not ((mtop["ok"] and mbot["ok"]) or (mlef["ok"] and mrig["ok"]) or okc >= 3):
-        return False
-
-    score = (mtop["cstd"] + mbot["cstd"] + mlef["cstd"] + mrig["cstd"]) / 4.0
-    return score >= 60.0
 def preproc(gray_or_rgb):
     if isinstance(gray_or_rgb, Image.Image):
         gray_or_rgb = np.array(gray_or_rgb)
@@ -275,11 +131,6 @@ def extract_card_for_index(i: int, img: Image.Image):
 
         # Prepare BGR for elite detector
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        elite = False
-        try:
-            elite = is_elite(bgr)
-        except Exception as e:
-            logging.warning(f"Elite detector error: {e}")
 
         # Resize for OCR
         resized = cv2.resize(
@@ -297,20 +148,19 @@ def extract_card_for_index(i: int, img: Image.Image):
 
         logging.info(
             f"✅ Card {i}: Gen={list(gens.keys()) or '∅'}, "
-            f"Name='{name or ''}', Series='{series or ''}', Elite={elite}"
+            f"Name='{name or ''}', Series='{series or ''}'"
         )
 
         # IMPORTANT: V2 EXPECTS (i, dict)
         return i, {
             "generations": gens,
             "name": name or "",
-            "series": series or "",
-            "elite": bool(elite),
+            "series": series or ""
         }
 
     except Exception as e:
         logging.warning(f"card {i} OCR error: {e}")
-        return i, {"generations": {}, "name": "", "series": "", "elite": False}
+        return i, {"generations": {}, "name": "", "series": ""}
 
 
 def extract_cards(img: Image.Image) -> Dict[int, dict]:
@@ -324,7 +174,7 @@ def extract_cards(img: Image.Image) -> Dict[int, dict]:
         for fut in [ex.submit(extract_card_for_index, k, crop(k)) for k in range(3)]:
             i, d = fut.result()
             out[i] = d
-            logging.info(f"✅ Card {i}: Gen={list((d['generations'] or {}).keys()) or '∅'}, Name='{d['name']}', Series='{d['series']}', Elite={d['elite']}")
+            logging.info(f"✅ Card {i}: Gen={list((d['generations'] or {}).keys()) or '∅'}, Name='{d['name']}', Series='{d['series']}'")
     return out
 
 # ---------------- Likes parser ----------------
@@ -939,17 +789,43 @@ class SofiBotManager:
             logging.info("⏳ Skip — cooldown not expired.")
             return True
         return False
+    def _is_elite_button(btn: dict) -> bool:
+        """
+        Sofi 'elite' card now uses a yellow heart on the claim button.
+        We treat any yellow-heart unicode (with possible skin-tone variants)
+        as elite. If the component has an emoji object, prefer that.
+        """
+        emo = btn.get("emoji") or {}
+        name = (emo.get("name") or "").strip()
+        # Unicode yellow heart and its common variants
+        YELLOW_HEARTS = {"💛", "💛🏻", "💛🏼", "💛🏽", "💛🏾", "💛🏿"}
+        if name in YELLOW_HEARTS:
+            return True
+
+        # Some deployments may push the emoji inside the label text
+        label = (btn.get("label") or "").strip()
+        return any(h in label for h in YELLOW_HEARTS)
 
     def _pick_from_image(self, img: Image.Image, components, channel_id, guild_id, m):
         # parse buttons (ignore links; ignore beyond first 3)
         pos_btns = []
         for row in components:
             for b in row.get("components", []):
-                if b.get("type") != 2 or not b.get("custom_id"):  # not a button or url button
+                # Only real buttons with a custom_id
+                if b.get("type") != 2 or not b.get("custom_id"):
                     continue
+
                 label = str(b.get("label") or "")
-                likes = parse_likes(label)     # None means acorn/event
-                pos_btns.append({"id": b["custom_id"], "likes": likes, "label": label})
+                likes = parse_likes(label)  # None => acorn/event
+                is_elite = _is_elite_button(b)
+
+                pos_btns.append({
+                    "id": b["custom_id"],
+                    "likes": likes,
+                    "label": label,
+                    "elite": is_elite,      # <- NEW
+                })
+
         pos_btns = pos_btns[:3]
         if not pos_btns:
             logging.warning("No claimable buttons found."); return
@@ -988,7 +864,7 @@ class SofiBotManager:
                 "min_gen": min_gen,
                 "has_gen": bool(gens),
                 "series": info.get("series","") or "",
-                "elite": bool(info.get("elite", False)),
+                "elite": bool(pos_btns[i].get("elite", False)),
             })
 
         # 2) ELITE
