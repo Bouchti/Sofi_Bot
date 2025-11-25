@@ -35,11 +35,14 @@ except Exception:
 # Selenium (Top.gg voting)
 HAVE_SELENIUM = True
 try:
+    import contextlib
+    import chromedriver_autoinstaller
     from selenium import webdriver
     from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.action_chains import ActionChains
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
-    import chromedriver_autoinstaller
+    from selenium.common.exceptions import TimeoutException, WebDriverException
 except Exception:
     HAVE_SELENIUM = False
 
@@ -209,7 +212,7 @@ def _is_writable(p: str) -> bool:
         return True
     except Exception:
         return False
-
+    
 class TopGGVoter:
     def __init__(
         self,
@@ -282,6 +285,77 @@ class TopGGVoter:
         drv.set_window_size(1200, 900)
         return drv
 
+    def _goto(self, url):
+        self.driver.set_page_load_timeout(self.page_load_timeout)
+        self.driver.get(url)
+        try:
+            WebDriverWait(self.driver, 10).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except Exception:
+            pass
+
+    def _accept_cookies_if_present(self):
+        wait = WebDriverWait(self.driver, 3)
+        with contextlib.suppress(Exception):
+            for by, sel in [
+                (By.XPATH, "//button[contains(., 'Accept')]"),
+                (By.XPATH, "//button[contains(., 'I agree')]"),
+                (By.XPATH, "//button[contains(., 'Got it')]"),
+            ]:
+                btn = wait.until(EC.element_to_be_clickable((by, sel)))
+                btn.click()
+                time.sleep(0.2)
+                break
+
+    def _find_vote_button(self, timeout=10):
+        wait = WebDriverWait(self.driver, timeout)
+        locators = [
+            (By.XPATH, "//button[.//span[contains(translate(., 'VOTE', 'vote'), 'vote')]]"),
+            (By.XPATH, "//button[contains(translate(., 'VOTE', 'vote'), 'vote')]"),
+            (By.CSS_SELECTOR, "button.Button__StyledButton-sc-1h3903b-0"),
+            (By.XPATH, "//button[contains(@class,'Button') and not(@disabled)]"),
+        ]
+        for by, sel in locators:
+            try:
+                el = wait.until(EC.element_to_be_clickable((by, sel)))
+                return el
+            except TimeoutException:
+                continue
+        return None
+
+    def _looks_logged_out(self):
+        # Simple heuristics: login prompts or OAuth buttons visible
+        if self.driver.find_elements(By.XPATH, "//*[contains(text(), 'Log in')]"):
+            return True
+        if self.driver.find_elements(By.XPATH, "//a[contains(@href,'/login')]"):
+            return True
+        return False
+
+    def _has_vote_confirmation(self):
+        d = self.driver
+        checks = [
+            (By.XPATH, "//*[contains(translate(., 'THANKS FOR VOTING', 'thanks for voting'), 'thanks for voting')]"),
+            (By.XPATH, "//*[contains(translate(., 'YOU ALREADY VOTED', 'you already voted'), 'you already voted')]"),
+            (By.XPATH, "//*[contains(translate(., 'VOTE AGAIN IN', 'vote again in'), 'vote again in')]"),
+            (By.XPATH, "//button[contains(., 'Voted') or contains(., 'Voted!') or @disabled='true' or @aria-disabled='true']"),
+        ]
+        for by, sel in checks:
+            if d.find_elements(by, sel):
+                return True
+        return False
+
+    def _extract_cooldown_seconds(self):
+        """
+        Try to read remaining cooldown like "Vote again in 11:43".
+        Returns seconds or None if not found.
+        """
+        text = self.driver.page_source.lower()
+        m = re.search(r"vote again in\s+(\d{1,2}):(\d{2})", text)
+        if not m:
+            return None
+        mm, ss = int(m.group(1)), int(m.group(2))
+        return mm * 60 + ss
 
     def _try_click(self, drv, xps, timeout=10):
         for xp in xps:
@@ -340,7 +414,46 @@ class TopGGVoter:
             except Exception:
                 pass
 
-# ---------------- Sofi Bot Manager ----------------
+
+
+# ---- background thread loop (non-blocking) ----
+def _vote_loop(self):
+        voter = TopGGVoter(
+            self.VOTE_URL,
+            self.VOTE_PROFILE_DIR or None,
+            self.VOTE_PROFILE_NAME or "Default",
+            self.VOTE_CHROME_BIN or None,
+            wait_secs=10,
+            attach_debugger=True,
+            debugger_address="127.0.0.1:9222",
+        )
+
+        def do_vote(tag=""):
+            try:
+                ok = voter.vote_once(tag or "")
+            except Exception as e:
+                logging.warning(f"[vote] error: {e}")
+                ok = False
+            self.watchdog_grace_until = max(self.watchdog_grace_until, time.time() + 240)
+            return ok
+
+        # --- Startup vote ---
+        logging.info("[vote] Attempting Top.gg vote (startup)…")
+        ok = do_vote("(startup)")
+        wait = self.VOTE_INTERVAL_H * 3600 + random.uniform(0, self.VOTE_JITTER_MIN * 60)
+        self.next_vote_at = time.time() + wait
+        logging.info(f"[vote] Vote {'OK' if ok else 'FAILED'} — next in ~{int(wait)}s")
+
+        # --- Main vote loop ---
+        while not self.stop_evt.is_set():
+            rem = self.next_vote_at - time.time()
+            if rem <= 0:
+                ok = do_vote()
+                wait = self.VOTE_INTERVAL_H * 3600 + random.uniform(0, self.VOTE_JITTER_MIN * 60)
+                self.next_vote_at = time.time() + wait
+                logging.info(f"[vote] Vote {'OK' if ok else 'FAILED'} — next in ~{int(wait)}s")
+
+            self.stop_evt.wait(min(30.0, max(1.0, rem)))
 class SofiBotManager:
     SOFI_BOT_ID = "853629533855809596"
 
@@ -450,8 +563,9 @@ class SofiBotManager:
             self.t_watch = threading.Thread(target=self._watchdog_loop, daemon=True); self.t_watch.start()
         if not self.t_claim_to or not self.t_claim_to.is_alive():
             self.t_claim_to = threading.Thread(target=self._claim_timeout_loop, daemon=True); self.t_claim_to.start()
-        if self.VOTE_ENABLED and HAVE_SELENIUM and (not self.t_vote or not self.t_vote.is_alive()):
-            self.t_vote = threading.Thread(target=self._vote_loop, daemon=True); self.t_vote.start()
+        if not hasattr(self, "t_vote") or not (self.t_vote and self.t_vote.is_alive()):
+            self.t_vote = threading.Thread(target=_vote_loop, args=(self,), daemon=True)
+            self.t_vote.start()
 
         def run_gw():
             logging.info("🔌 Connecting to Discord gateway …")
@@ -591,43 +705,6 @@ class SofiBotManager:
                     logging.warning("⏱️ Claim confirmation timeout. Resetting trigger.")
                     self.pending_claim["triggered"] = False
 
-    def _vote_loop(self):
-        voter = TopGGVoter(
-            self.VOTE_URL,
-            self.VOTE_PROFILE_DIR or None,
-            self.VOTE_PROFILE_NAME or "Default",
-            self.VOTE_CHROME_BIN or None,
-            wait_secs=10,
-            attach_debugger=True,
-            debugger_address="127.0.0.1:9222",
-        )
-
-        def do_vote(tag=""):
-            try:
-                ok = voter.vote_once(tag or "")
-            except Exception as e:
-                logging.warning(f"[vote] error: {e}")
-                ok = False
-            self.watchdog_grace_until = max(self.watchdog_grace_until, time.time() + 240)
-            return ok
-
-        # --- Startup vote ---
-        logging.info("[vote] Attempting Top.gg vote (startup)…")
-        ok = do_vote("(startup)")
-        wait = self.VOTE_INTERVAL_H * 3600 + random.uniform(0, self.VOTE_JITTER_MIN * 60)
-        self.next_vote_at = time.time() + wait
-        logging.info(f"[vote] Vote {'OK' if ok else 'FAILED'} — next in ~{int(wait)}s")
-
-        # --- Main vote loop ---
-        while not self.stop_evt.is_set():
-            rem = self.next_vote_at - time.time()
-            if rem <= 0:
-                ok = do_vote()
-                wait = self.VOTE_INTERVAL_H * 3600 + random.uniform(0, self.VOTE_JITTER_MIN * 60)
-                self.next_vote_at = time.time() + wait
-                logging.info(f"[vote] Vote {'OK' if ok else 'FAILED'} — next in ~{int(wait)}s")
-
-            self.stop_evt.wait(min(30.0, max(1.0, rem)))
     # ---------- gateway handlers ----------
     def _install_handlers(self):
         @self.bot.gateway.command
@@ -789,7 +866,7 @@ class SofiBotManager:
             logging.info("⏳ Skip — cooldown not expired.")
             return True
         return False
-    def _is_elite_button(btn: dict) -> bool:
+    def _is_elite_button(self, btn: dict) -> bool:
         """
         Sofi 'elite' card now uses a yellow heart on the claim button.
         We treat any yellow-heart unicode (with possible skin-tone variants)
@@ -797,12 +874,9 @@ class SofiBotManager:
         """
         emo = btn.get("emoji") or {}
         name = (emo.get("name") or "").strip()
-        # Unicode yellow heart and its common variants
         YELLOW_HEARTS = {"💛", "💛🏻", "💛🏼", "💛🏽", "💛🏾", "💛🏿"}
         if name in YELLOW_HEARTS:
             return True
-
-        # Some deployments may push the emoji inside the label text
         label = (btn.get("label") or "").strip()
         return any(h in label for h in YELLOW_HEARTS)
 
@@ -817,7 +891,7 @@ class SofiBotManager:
 
                 label = str(b.get("label") or "")
                 likes = parse_likes(label)  # None => acorn/event
-                is_elite = _is_elite_button(b)
+                is_elite = self._is_elite_button(b)
 
                 pos_btns.append({
                     "id": b["custom_id"],
