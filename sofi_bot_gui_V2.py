@@ -347,15 +347,32 @@ class TopGGVoter:
 
     def _extract_cooldown_seconds(self):
         """
-        Try to read remaining cooldown like "Vote again in 11:43".
-        Returns seconds or None if not found.
+        Supports:
+        - "vote again in 11:43"  (mm:ss)
+        - "You can vote again in about 12 hours"
+        - "... about 30 minutes"
+        Returns seconds or None.
         """
-        text = self.driver.page_source.lower()
+        text = (self.driver.page_source or "").lower()
+
+        # mm:ss case
         m = re.search(r"vote again in\s+(\d{1,2}):(\d{2})", text)
-        if not m:
-            return None
-        mm, ss = int(m.group(1)), int(m.group(2))
-        return mm * 60 + ss
+        if m:
+            mm, ss = int(m.group(1)), int(m.group(2))
+            return mm * 60 + ss
+
+        # "about X hours"
+        m = re.search(r"vote again in about\s+(\d+(?:\.\d+)?)\s+hours?", text)
+        if m:
+            return int(float(m.group(1)) * 3600)
+
+        # "about X minutes"
+        m = re.search(r"vote again in about\s+(\d+(?:\.\d+)?)\s+minutes?", text)
+        if m:
+            return int(float(m.group(1)) * 60)
+
+        return None
+
 
     def _try_click(self, drv, xps, timeout=10):
         for xp in xps:
@@ -367,16 +384,21 @@ class TopGGVoter:
             except Exception:
                 continue
         return False
-
+    
     def vote_once(self, tag: str = "") -> bool:
         if not HAVE_SELENIUM:
             logging.warning("[vote] Selenium not installed")
             return False
+
+        self.last_cooldown_seconds = None  # <-- add this attribute (new)
         drv = None
         try:
             drv = self._driver()
+            self.driver = drv  # <-- IMPORTANT
+
             drv.get(self.url)
-            # cookies (best-effort)
+
+            # cookies best-effort (keep yours)
             try:
                 WebDriverWait(drv, 6).until(
                     EC.any_of(
@@ -386,25 +408,35 @@ class TopGGVoter:
                 ).click()
             except Exception:
                 pass
+
             time.sleep(self.wait_secs)
-            # If already logged, Vote should be visible
-            if self._try_click(drv, ["//button[normalize-space()='Vote']",
-                                     "//a[normalize-space()='Vote']",
-                                     "//*[@data-qa='vote-button' or @data-testid='vote-button']"], timeout=8):
+
+            # ✅ If already voted, read cooldown and exit
+            cd = self._extract_cooldown_seconds()
+            if cd:
+                self.last_cooldown_seconds = cd
+                logging.info(f"[vote] Already voted — cooldown {int(cd//3600)}h{int((cd%3600)//60)}m")
+                return False
+
+            # Try click vote
+            clicked = self._try_click(drv, [
+                "//button[normalize-space()='Vote']",
+                "//a[normalize-space()='Vote']",
+                "//*[@data-qa='vote-button' or @data-testid='vote-button']"
+            ], timeout=8)
+
+            if clicked:
+                # After click, re-check cooldown/confirmation
+                time.sleep(1.5)
+                cd = self._extract_cooldown_seconds()
+                if cd:
+                    self.last_cooldown_seconds = cd
                 logging.info("[vote] Vote clicked on Top.gg")
                 return True
-            # If not, try quick login flow (user should already be logged in via profile; this is fallback)
-            self._try_click(drv, ["//a[normalize-space()='Log In']","//button[normalize-space()='Log In']"], timeout=6)
-            self._try_click(drv, ["//button[contains(., 'Discord')]", "//a[contains(., 'Discord')]"], timeout=8)
-            # After redirect back, attempt vote again
-            time.sleep(5)
-            if self._try_click(drv, ["//button[normalize-space()='Vote']",
-                                     "//a[normalize-space()='Vote']",
-                                     "//*[@data-qa='vote-button' or @data-testid='vote-button']"], timeout=8):
-                logging.info("[vote] Vote clicked on Top.gg")
-                return True
+
             logging.warning("[vote] Vote button not found")
             return False
+
         except Exception as e:
             logging.warning(f"[vote] failed: {e}")
             return False
@@ -413,6 +445,7 @@ class TopGGVoter:
                 if drv: drv.quit()
             except Exception:
                 pass
+
 
 
 
@@ -440,7 +473,11 @@ def _vote_loop(self):
         # --- Startup vote ---
         logging.info("[vote] Attempting Top.gg vote (startup)…")
         ok = do_vote("(startup)")
-        wait = self.VOTE_INTERVAL_H * 3600 + random.uniform(0, self.VOTE_JITTER_MIN * 60)
+        cd = getattr(voter, "last_cooldown_seconds", None)
+        if cd:
+            wait = cd + random.uniform(0, self.VOTE_JITTER_MIN * 60)
+        else:
+            wait = self.VOTE_INTERVAL_H * 3600 + random.uniform(0, self.VOTE_JITTER_MIN * 60)
         self.next_vote_at = time.time() + wait
         logging.info(f"[vote] Vote {'OK' if ok else 'FAILED'} — next in ~{int(wait)}s")
 
@@ -454,6 +491,12 @@ def _vote_loop(self):
                 logging.info(f"[vote] Vote {'OK' if ok else 'FAILED'} — next in ~{int(wait)}s")
 
             self.stop_evt.wait(min(30.0, max(1.0, rem)))
+def get_remaining_vote_time(self):
+    if not hasattr(self, "next_vote_time"): 
+        return 0
+    remaining = self.next_vote_time - time.time()
+    return max(0, remaining)
+
 class SofiBotManager:
     SOFI_BOT_ID = "853629533855809596"
 
@@ -563,7 +606,7 @@ class SofiBotManager:
             self.t_watch = threading.Thread(target=self._watchdog_loop, daemon=True); self.t_watch.start()
         if not self.t_claim_to or not self.t_claim_to.is_alive():
             self.t_claim_to = threading.Thread(target=self._claim_timeout_loop, daemon=True); self.t_claim_to.start()
-        if not hasattr(self, "t_vote") or not (self.t_vote and self.t_vote.is_alive()):
+        if self.VOTE_ENABLED and (not self.t_vote or not self.t_vote.is_alive()):
             self.t_vote = threading.Thread(target=_vote_loop, args=(self,), daemon=True)
             self.t_vote.start()
 
@@ -1347,14 +1390,17 @@ class SofiGUI:
         threading.Thread(target=do, daemon=True).start()
 
     def _tick_vote_label(self):
-        if self.mgr.VOTE_ENABLED and self.mgr.next_vote_at>0:
+        if self.mgr.VOTE_ENABLED and self.mgr.next_vote_at > 0:
             rem = int(self.mgr.next_vote_at - time.time())
             if rem < 0: rem = 0
-            hh = rem//3600; mm = (rem%3600)//60
+            hh = rem // 3600
+            mm = (rem % 3600) // 60
             self.lbl_next_vote.config(text=f"Next vote in: {hh}h {mm}m")
         else:
             self.lbl_next_vote.config(text="Next vote: —")
-            self.root.after(1000, self._tick_vote_label)
+
+        # ✅ ALWAYS reschedule
+        self.root.after(1000, self._tick_vote_label)
 
 
     def _sig(self, *args):
