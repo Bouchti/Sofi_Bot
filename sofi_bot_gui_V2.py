@@ -802,8 +802,9 @@ class SofiBotManager:
                     self.pending_claim["triggered"] = False
                     if not self.first_claim_made:
                         self.first_claim_made = True
-                        self.next_sgr_at = time.time()
-                        logging.info("[raid] first claim seen; sending sgr now.")
+                        if self.next_sgr_at <= 0 and not self.raid_active:
+                            self.next_sgr_at = time.time()
+                            logging.info("[raid] first claim seen; sending sgr now.")
                     return
 
             if self._handle_raid_message(content, embeds, comps, channel_id, guild_id, m):
@@ -816,9 +817,10 @@ class SofiBotManager:
                 logging.info(f"[sofi-drop] cooldown received; next sd in {ready_secs}s.")
                 if not (self.first_claim_made or self.first_cooldown_seen):
                     self.first_cooldown_seen = True
-                    wait = max(0.0, self.SGR_AFTER_COOLDOWN_DELAY) + random.uniform(0.0, self.SGR_JITTER_SEC)
-                    self.next_sgr_at = time.time() + wait
-                    logging.info(f"[raid] first cooldown seen; sgr in {wait:.1f}s.")
+                    if self.next_sgr_at <= 0 and not self.raid_active:
+                        wait = max(0.0, self.SGR_AFTER_COOLDOWN_DELAY) + random.uniform(0.0, self.SGR_JITTER_SEC)
+                        self.next_sgr_at = time.time() + wait
+                        logging.info(f"[raid] first cooldown seen; sgr in {wait:.1f}s.")
                 return
 
             if not comps:
