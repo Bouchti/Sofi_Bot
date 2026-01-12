@@ -102,6 +102,24 @@ def parse_cards_from_message(content: str) -> Dict[int, dict]:
         }
     return out
 
+def parse_drop_ready_seconds(content: str) -> Optional[int]:
+    if not content:
+        return None
+    m = re.search(r"\*{0,2}drop\*{0,2}\s+will\s+be\s+ready\s+in:\s*\*\*(.+?)\*\*", content, re.IGNORECASE)
+    if not m:
+        return None
+    text = m.group(1).lower()
+    mins = 0
+    secs = 0
+    mm = re.search(r"(\d+)\s*m", text)
+    ss = re.search(r"(\d+)\s*s", text)
+    if mm:
+        mins = int(mm.group(1))
+    if ss:
+        secs = int(ss.group(1))
+    total = mins * 60 + secs
+    return total if total > 0 else None
+
 # ---------------- Selenium helpers ----------------
 def _find_chrome_win() -> Optional[str]:
     for p in [
@@ -470,12 +488,29 @@ class SofiBotManager:
         # threads
         self.t_gateway = None
         self.t_sd = None
+        self.t_sgr = None
         self.t_watch = None
         self.t_claim_to = None
         self.t_vote = None
         self.next_sd_at = 0.0           # unix ts for next 'sd'
         self.SD_BASE_INTERVAL = 480.0   # 8 minutes
         self.SD_JITTER_SEC   = 8.0      # small human-ish jitter
+        # raid (sgr)
+        self.SGR_INTERVAL_H = float(os.getenv("SGR_INTERVAL_HOURS", "3"))
+        self.SGR_JITTER_SEC = float(os.getenv("SGR_JITTER_SEC", "30"))
+        self.SGR_AFTER_COOLDOWN_DELAY = float(os.getenv("SGR_AFTER_COOLDOWN_DELAY_SEC", "3.0"))
+        self.RAID_STEP_DELAY = float(os.getenv("RAID_STEP_DELAY_SEC", "2.0"))
+        self.RAID_STEP_JITTER = float(os.getenv("RAID_STEP_JITTER_SEC", "0.4"))
+        self.next_sgr_at = 0.0
+        self.sd_paused = threading.Event()
+        self.raid_active = False
+        self.raid_step = "idle"
+        self.raid_move_index = 0
+        self._raid_lock = threading.Lock()
+        self._raid_last_action = None
+        self.first_claim_made = False
+        self._sgr_wait_log_at = 0.0
+        self.first_cooldown_seen = False
         # reboot guard
         self._reboot_lock = threading.Lock()
         self._last_reboot = 0.0
@@ -504,6 +539,8 @@ class SofiBotManager:
         # threads
         if not self.t_sd or not self.t_sd.is_alive():
             self.t_sd = threading.Thread(target=self._sd_loop, daemon=True); self.t_sd.start()
+        if not self.t_sgr or not self.t_sgr.is_alive():
+            self.t_sgr = threading.Thread(target=self._sgr_loop, daemon=True); self.t_sgr.start()
         if not self.t_watch or not self.t_watch.is_alive():
             self.t_watch = threading.Thread(target=self._watchdog_loop, daemon=True); self.t_watch.start()
         if not self.t_claim_to or not self.t_claim_to.is_alive():
@@ -531,14 +568,14 @@ class SofiBotManager:
                 self.bot.gateway.close()
         except Exception:
             pass
-        for t in (self.t_sd, self.t_watch, self.t_claim_to, self.t_vote):
+        for t in (self.t_sd, self.t_sgr, self.t_watch, self.t_claim_to, self.t_vote):
             if t and t.is_alive():
                 try: t.join(timeout=2.0)
                 except Exception: pass
         if self.t_gateway and self.t_gateway.is_alive():
             try: self.t_gateway.join(timeout=3.0)
             except Exception: pass
-        self.t_gateway = self.t_sd = self.t_watch = self.t_claim_to = self.t_vote = None
+        self.t_gateway = self.t_sd = self.t_sgr = self.t_watch = self.t_claim_to = self.t_vote = None
         logging.info("✅ Bot stopped.")
 
     def reboot(self, reason: str):
@@ -563,6 +600,9 @@ class SofiBotManager:
         # If gateway not ready, wait a hair and retry
         if not (self.gateway_ready):
             logging.info("📤 waiting for gateway ready")
+            self.stop_evt.wait(1.0)
+            continue
+        if self.sd_paused.is_set():
             self.stop_evt.wait(1.0)
             continue
 
@@ -593,6 +633,43 @@ class SofiBotManager:
         # sleep until next tick
         self.stop_evt.wait(0.5)
 
+    def _sgr_loop(self):
+        while not self.stop_evt.is_set():
+            if not (self.gateway_ready):
+                self.stop_evt.wait(1.0)
+                continue
+            if not (self.first_claim_made or self.first_cooldown_seen):
+                if self.next_sgr_at <= 0:
+                    now = time.time()
+                    if now - self._sgr_wait_log_at > 10.0:
+                        logging.info("[raid] waiting for first claim/cooldown before sgr.")
+                        self._sgr_wait_log_at = now
+                self.stop_evt.wait(1.0)
+                continue
+            if self.next_sgr_at <= 0:
+                self.next_sgr_at = time.time() + 5.0
+
+            now = time.time()
+            if now >= self.next_sgr_at and not self.raid_active:
+                try:
+                    self.sd_paused.set()
+                    self.next_sd_at = time.time() + 5.0
+                    self.bot.sendMessage(self.CHANNEL, "sgr")
+                    logging.info("📤 sent 'sgr' (raid)")
+                    with self._raid_lock:
+                        self.raid_active = True
+                        self.raid_step = "start1"
+                        self.raid_move_index = 0
+                        self._raid_last_action = None
+                except Exception as e:
+                    logging.warning(f"sgr send error: {e}")
+                    self.sd_paused.clear()
+
+                wait = max(60.0, self.SGR_INTERVAL_H * 3600.0) + random.uniform(0.0, self.SGR_JITTER_SEC)
+                self.next_sgr_at = time.time() + wait
+
+            self.stop_evt.wait(1.0)
+
     def _watchdog_loop(self):
         while not self.stop_evt.is_set():
             time.sleep(3)
@@ -606,6 +683,11 @@ class SofiBotManager:
             tsd = self.t_sd
             if tsd is not None and not tsd.is_alive():
                 self.reboot("sd loop thread died")
+                return
+
+            tsgr = self.t_sgr
+            if tsgr is not None and not tsgr.is_alive():
+                self.reboot("sgr loop thread died")
                 return
             
             # global grace window
@@ -634,7 +716,7 @@ class SofiBotManager:
                 return
 
             # Sofi stall: we keep sending 'sd' but we never see a Sofi drop
-            if self.last_sd_sent_ts:
+            if self.last_sd_sent_ts and not self.sd_paused.is_set():
                 # if we have never seen a drop OR the last drop is older than the last 'sd'
                 if (not self.last_sofi_drop_ts) or (self.last_sofi_drop_ts < self.last_sd_sent_ts):
                     if (now - self.last_sd_sent_ts) > self.SOFI_STALL_TIMEOUT:
@@ -675,21 +757,23 @@ class SofiBotManager:
 
         @self.bot.gateway.command
         def on_message(resp):
-            if not hasattr(resp,"raw") or resp.raw.get("t") != "MESSAGE_CREATE":
+            if not hasattr(resp,"raw") or resp.raw.get("t") not in ("MESSAGE_CREATE", "MESSAGE_UPDATE"):
                 return
             d = resp.raw["d"]
             m = resp.parsed.auto()
 
-            author_id = str(d.get("author", {}).get("id"))
+            author_id = str(d.get("author", {}).get("id") or (m.get("author", {}) or {}).get("id") or "")
             if author_id != SofiBotManager.SOFI_BOT_ID:
                 return
 
+            event_t = resp.raw.get("t")
             channel_id = str(d.get("channel_id"))
             guild_id   = str(d.get("guild_id")) if d.get("guild_id") else None
             content    = d.get("content", "")
             comps      = d.get("components", []) or []
+            embeds     = d.get("embeds", []) or []
             logging.info(
-                f"[sofi-debug] ch={channel_id} comps={len(comps)} content={content[:80]!r}"
+                f"[sofi-debug] t={event_t} ch={channel_id} comps={len(comps)} embeds={len(embeds)} content={content[:80]!r}"
             )
                 # confirmation
             if self.pending_claim["triggered"]:
@@ -716,7 +800,26 @@ class SofiBotManager:
                     with self.last_processed_lock:
                         self.last_processed_time = time.time()
                     self.pending_claim["triggered"] = False
+                    if not self.first_claim_made:
+                        self.first_claim_made = True
+                        self.next_sgr_at = time.time()
+                        logging.info("[raid] first claim seen; sending sgr now.")
                     return
+
+            if self._handle_raid_message(content, embeds, comps, channel_id, guild_id, m):
+                return
+
+            ready_secs = parse_drop_ready_seconds(content)
+            if ready_secs:
+                # Push next sd after server cooldown, with a small buffer.
+                self.next_sd_at = time.time() + ready_secs + 2.0
+                logging.info(f"[sofi-drop] cooldown received; next sd in {ready_secs}s.")
+                if not (self.first_claim_made or self.first_cooldown_seen):
+                    self.first_cooldown_seen = True
+                    wait = max(0.0, self.SGR_AFTER_COOLDOWN_DELAY) + random.uniform(0.0, self.SGR_JITTER_SEC)
+                    self.next_sgr_at = time.time() + wait
+                    logging.info(f"[raid] first cooldown seen; sgr in {wait:.1f}s.")
+                return
 
             if not comps:
                 logging.info(f"[sofi-drop] no components; skip. content={content[:120]!r}")
@@ -792,6 +895,157 @@ class SofiBotManager:
             logging.info("⏳ Skip — cooldown not expired.")
             return True
         return False
+
+    def _iter_components(self, components):
+        for row in components:
+            for comp in row.get("components", []):
+                yield comp
+
+    def _find_button(self, components, label_contains: str):
+        target = (label_contains or "").lower()
+        for comp in self._iter_components(components):
+            if comp.get("type") != 2:
+                continue
+            label = (comp.get("label") or "").strip().lower()
+            if target in label:
+                return comp
+        return None
+
+    def _find_select(self, components):
+        for comp in self._iter_components(components):
+            if comp.get("type") == 3:
+                return comp
+        return None
+
+    def _log_components(self, components, tag):
+        items = []
+        for comp in self._iter_components(components):
+            items.append({
+                "type": comp.get("type"),
+                "label": (comp.get("label") or ""),
+                "custom_id": comp.get("custom_id"),
+                "disabled": comp.get("disabled"),
+            })
+        logging.info(f"[raid] {tag} components={items}")
+
+    def _select_menu(self, menu_id, value, channel_id, guild_id, m, tag=""):
+        try:
+            self.bot.click(
+                applicationID=m["author"]["id"],
+                channelID=channel_id,
+                guildID=m.get("guild_id"),
+                messageID=m["id"],
+                messageFlags=m["flags"],
+                data={"component_type": 3, "custom_id": menu_id, "values": [value]},
+            )
+            if tag: logging.info(tag)
+        except Exception as e:
+            logging.warning(f"menu select error: {e}")
+
+    def _sleep_human(self, base: float):
+        jitter = max(0.0, self.RAID_STEP_JITTER)
+        time.sleep(max(0.0, base + random.uniform(-jitter, jitter)))
+
+    def _raid_ended(self, content: str, embeds: list) -> bool:
+        text = (content or "").lower()
+        if "raid: ended" in text or "raid ended" in text:
+            return True
+        for e in embeds or []:
+            title = (e.get("title") or "").lower()
+            desc = (e.get("description") or "").lower()
+            if "raid: ended" in title or "raid ended" in title or "raid: ended" in desc or "raid ended" in desc:
+                return True
+        return False
+
+    def _handle_raid_message(self, content, embeds, components, channel_id, guild_id, m) -> bool:
+        has_raid_ui = any(
+            k in (content or "").lower()
+            for k in ("raid", "start raid", "select moves", "apply")
+        )
+        has_raid_ui = has_raid_ui or bool(self._find_button(components, "start raid")) or bool(self._find_select(components))
+
+        if not self.raid_active and not has_raid_ui:
+            return False
+
+        if self._raid_ended(content, embeds):
+            with self._raid_lock:
+                self.raid_active = False
+                self.raid_step = "idle"
+                self.raid_move_index = 0
+                self._raid_last_action = None
+            self.sd_paused.clear()
+            self.next_sd_at = time.time() + 5.0
+            wait = max(60.0, self.SGR_INTERVAL_H * 3600.0) + random.uniform(0.0, self.SGR_JITTER_SEC)
+            self.next_sgr_at = time.time() + wait
+            logging.info("[raid] ended; sd resumed.")
+            return True
+
+        if not self.raid_active:
+            return False
+
+        if not components:
+            if embeds:
+                e0 = embeds[0] if embeds else {}
+                title = (e0.get("title") or "")
+                desc = (e0.get("description") or "")
+                logging.info(f"[raid] no components; embed title={title!r} desc={desc[:120]!r}")
+            return True
+
+        msg_id = m.get("id")
+        btn_start = self._find_button(components, "start raid")
+        btn_apply = self._find_button(components, "apply")
+        menu = self._find_select(components)
+
+        if self.raid_step in ("start1", "start2") and btn_start:
+            action_key = ("start", msg_id, self.raid_step)
+            if self._raid_last_action == action_key:
+                return True
+
+            def worker():
+                self._sleep_human(self.RAID_STEP_DELAY)
+                self._btn_click(btn_start["custom_id"], channel_id, guild_id, m, tag="[raid] click Start Raid")
+                with self._raid_lock:
+                    self._raid_last_action = action_key
+                    if self.raid_step == "start1":
+                        self.raid_step = "start2"
+                    elif self.raid_step == "start2":
+                        self.raid_step = "moves"
+
+            threading.Thread(target=worker, daemon=True).start()
+            return True
+        if self.raid_step in ("start1", "start2") and not btn_start:
+            self._log_components(components, "start button not found")
+            return True
+
+        if self.raid_step == "moves" and menu and btn_apply:
+            options = menu.get("options", []) or []
+            options = [o for o in options if "refresh" not in (o.get("label") or "").lower()]
+            if not options:
+                return True
+            idx = self.raid_move_index % len(options)
+            opt = options[idx]
+            value = opt.get("value")
+            label = opt.get("label") or f"move-{idx+1}"
+            action_key = ("move", msg_id, self.raid_move_index)
+            if not value or self._raid_last_action == action_key:
+                return True
+
+            def worker():
+                self._sleep_human(self.RAID_STEP_DELAY)
+                self._select_menu(menu["custom_id"], value, channel_id, guild_id, m, tag=f"[raid] select {label}")
+                self._sleep_human(self.RAID_STEP_DELAY)
+                self._btn_click(btn_apply["custom_id"], channel_id, guild_id, m, tag=f"[raid] apply {label}")
+                with self._raid_lock:
+                    self._raid_last_action = action_key
+                    self.raid_move_index += 1
+
+            threading.Thread(target=worker, daemon=True).start()
+            return True
+        if self.raid_step == "moves" and (not menu or not btn_apply):
+            self._log_components(components, "moves menu/apply not found")
+            return True
+
+        return True
     def _is_elite_button(self, btn: dict) -> bool:
         """
         Sofi 'elite' card now uses a yellow heart on the claim button.
