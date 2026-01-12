@@ -5,19 +5,10 @@ Sofi Farming Bot — GUI + Top.gg voter (Chrome profile reuse)
 DISCLAIMER: Using self-bots violates Discord ToS. You assume all risk.
 """
 
-import os, re, sys, time, random, threading, signal, logging, tempfile, shutil
-from io import BytesIO
-from typing import Optional, List, Dict
-from concurrent.futures import ThreadPoolExecutor
+import os, re, sys, time, random, threading, signal, logging, tempfile, shutil, math
+from typing import Optional, Dict
 
 # ---------------- lib deps ----------------
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import numpy as np
-from PIL import Image
-import cv2
-import easyocr
 import discum
 from dotenv import load_dotenv
 
@@ -32,7 +23,7 @@ try:
 except Exception:
     HAVE_TTKTHEMES = False
 
-# Selenium (Top.gg voting)
+# Selenium (Top.gg votings)
 HAVE_SELENIUM = True
 try:
     import contextlib
@@ -57,129 +48,6 @@ logging.basicConfig(
 logging.getLogger("websocket").setLevel(logging.CRITICAL)
 logging.getLogger("discum.gateway.gateway").setLevel(logging.ERROR)
 
-# ---------------- HTTP ----------------
-def http_session() -> requests.Session:
-    retry = Retry(
-        total=5, connect=5, read=3,
-        backoff_factor=0.5,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=False,
-        raise_on_status=False,
-        respect_retry_after_header=True,
-    )
-    s = requests.Session()
-    s.mount("https://", HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=16))
-    s.mount("http://",  HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=16))
-    s.headers.update({"User-Agent": "SofiBot/2.0 (+requests)"})
-    return s
-
-def pil_from_url(s: requests.Session, url: str, timeout=15.0) -> Optional[Image.Image]:
-    try:
-        r = s.get(url, timeout=timeout)
-        r.raise_for_status()
-        return Image.open(BytesIO(r.content)).convert("RGB")
-    except Exception as e:
-        logging.warning(f"Image fetch failed: {e}")
-        return None
-
-# ---------------- OCR (global) ----------------
-READER = None
-def preproc(gray_or_rgb):
-    if isinstance(gray_or_rgb, Image.Image):
-        gray_or_rgb = np.array(gray_or_rgb)
-    if gray_or_rgb.ndim == 3:
-        return cv2.cvtColor(gray_or_rgb, cv2.COLOR_RGB2GRAY)
-    return gray_or_rgb
-
-def _clean_gen_text(texts: List[str]) -> Dict[str, int]:
-    out = {}
-    for t in texts:
-        if len(out) >= 3: break
-        t = (t or "").strip()
-        if not t: continue
-        # Special case: 6G123
-        m6 = re.match(r"^6G(\d{1,4})$", t.upper())
-        if m6:
-            out[f"G{m6.group(1)}"] = int(m6.group(1))
-            continue
-        z = re.sub(r"[^a-zA-Z0-9]", "", t)
-        z = (z.replace("i","1").replace("I","1")
-               .replace("o","0").replace("O","0")
-               .replace("g","9").replace("s","5").replace("S","5")
-               .replace("B","8").replace("l","1"))
-        if z and z[0] in ("0","6","5","9") and not z.upper().startswith("G"):
-            z = "G"+z[1:]
-        m = re.match(r"^G(\d{1,4})$", z.upper())
-        if m:
-            out[f"G{m.group(1)}"] = int(m.group(1))
-    return out
-
-def _extract_name_series(texts: List[str]):
-    if not texts or len(texts) < 2: return None, None
-    gi = -1
-    for i,t in enumerate(texts):
-        if _clean_gen_text([t]): gi = i; break
-    if gi == -1: return None, None
-    name  = (texts[gi+1] if gi+1 < len(texts) else None) or ""
-    series= (texts[gi+2] if gi+2 < len(texts) else None) or ""
-    return name.strip(), series.strip()
-
-def extract_card_for_index(i: int, img: Image.Image):
-    try:
-        # Convert to RGB array
-        rgb = np.array(img) if isinstance(img, Image.Image) else img
-
-        # V2 uses 'preproc', not '_preproc_image'
-        gray = preproc(rgb)
-
-        # Prepare BGR for elite detector
-        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-
-        # Resize for OCR
-        resized = cv2.resize(
-            gray,
-            (300, int(gray.shape[0] * (300.0 / gray.shape[1]))),
-            interpolation=cv2.INTER_AREA,
-        )
-
-        # OCR text
-        texts = READER.readtext(resized, detail=0, batch_size=2)
-
-        # Extract gens / name / series
-        gens = _clean_gen_text(texts)
-        name, series = _extract_name_series(texts)
-
-        logging.info(
-            f"✅ Card {i}: Gen={list(gens.keys()) or '∅'}, "
-            f"Name='{name or ''}', Series='{series or ''}'"
-        )
-
-        # IMPORTANT: V2 EXPECTS (i, dict)
-        return i, {
-            "generations": gens,
-            "name": name or "",
-            "series": series or ""
-        }
-
-    except Exception as e:
-        logging.warning(f"card {i} OCR error: {e}")
-        return i, {"generations": {}, "name": "", "series": ""}
-
-
-def extract_cards(img: Image.Image) -> Dict[int, dict]:
-    w = img.width//3
-    def crop(k):
-        L = k*w
-        R = L+w if k<2 else img.width
-        return img.crop((L,0,R,img.height))
-    out = {}
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        for fut in [ex.submit(extract_card_for_index, k, crop(k)) for k in range(3)]:
-            i, d = fut.result()
-            out[i] = d
-            logging.info(f"✅ Card {i}: Gen={list((d['generations'] or {}).keys()) or '∅'}, Name='{d['name']}', Series='{d['series']}'")
-    return out
-
 # ---------------- Likes parser ----------------
 def parse_likes(label: str) -> Optional[int]:
     # Supports "1.9K", "2K", "3M" (rare), and "2,345"
@@ -192,6 +60,47 @@ def parse_likes(label: str) -> Optional[int]:
     if suf == "k": val *= 1000
     elif suf == "m": val *= 1_000_000
     return int(round(val))
+
+def parse_cards_from_message(content: str) -> Dict[int, dict]:
+    out = {}
+    if not content:
+        return out
+    for line in content.splitlines():
+        clean_line = (line or "").replace("\u200b", "").replace("`", "")
+        clean_line = clean_line.replace("\u2013", "-").replace("\u2014", "-").replace("\u2212", "-")
+        m = re.match(r"^\s*([1-3])\s*\.\s*(.+)$", clean_line)
+        if not m:
+            continue
+        idx = int(m.group(1)) - 1
+        rest = m.group(2).strip()
+        if rest.startswith("<") or rest.startswith(":"):
+            if "|" in rest:
+                rest = rest.split("|", 1)[1].strip()
+
+        gen_m = re.search(r"\[\s*G\s*[- ]?\s*(\d{1,4})\s*\]?", rest, re.IGNORECASE)
+        if not gen_m:
+            gen_m = re.search(r"\bG\s*[- ]?\s*(\d{1,4})\b", rest, re.IGNORECASE)
+        if not gen_m:
+            gen_m = re.search(r"\bG\D{0,3}(\d{1,4})\b", rest, re.IGNORECASE)
+        gen = int(gen_m.group(1)) if gen_m else None
+        tail = rest[gen_m.end():] if gen_m else rest
+        tail = tail.lstrip("] ").strip()
+        if "|" in tail:
+            tail = tail.split("|", 1)[1].strip()
+        name = ""
+        series = ""
+        if tail:
+            parts = re.split(r"\s[-–•·]\s", tail, maxsplit=1)
+            name = parts[0].strip()
+            if len(parts) > 1:
+                series = parts[1].strip()
+        out[idx] = {
+            "min_gen": gen,
+            "has_gen": gen is not None,
+            "name": name,
+            "series": series,
+        }
+    return out
 
 # ---------------- Selenium helpers ----------------
 def _find_chrome_win() -> Optional[str]:
@@ -534,7 +443,6 @@ class SofiBotManager:
         self.VOTE_JITTER_MIN   = float(os.getenv("TOPGG_VOTE_JITTER_MINUTES","7"))
 
         # state
-        self.http = http_session()
         self.bot  = None
         self.stop_evt = threading.Event()
         self.gateway_ready = False
@@ -573,7 +481,7 @@ class SofiBotManager:
         self._last_reboot = 0.0
         self.REBOOT_MIN_INTERVAL = 20.0
         self.last_sd_ts = 0.0
-        # Track last time we *saw* a Sofi drop fully (with components+image)
+        # Track last time we *saw* a Sofi drop fully (with components+message)
         self.last_sofi_drop_ts = 0.0
         # Track last time we *sent* an 'sd' command
         self.last_sd_sent_ts = 0.0
@@ -584,12 +492,6 @@ class SofiBotManager:
 
         
     def start(self):
-        global READER
-        logging.info(f"🔎 Initializing EasyOCR (gpu=False) …")
-        if READER is None:
-            READER = easyocr.Reader(["en"], gpu=False, verbose=False)
-            _ = READER.readtext(np.zeros((50,50,3),dtype=np.uint8), detail=0)
-
         self.stop_evt.clear()
         self.bot = discum.Client(token=self.TOKEN, log=False)
         self._install_handlers()
@@ -786,11 +688,8 @@ class SofiBotManager:
             guild_id   = str(d.get("guild_id")) if d.get("guild_id") else None
             content    = d.get("content", "")
             comps      = d.get("components", []) or []
-            atts       = d.get("attachments", []) or []
-            embeds     = d.get("embeds", []) or []
             logging.info(
-                f"[sofi-debug] ch={channel_id} comps={len(comps)} "
-                f"atts={len(atts)} embeds={len(embeds)} content={content[:80]!r}"
+                f"[sofi-debug] ch={channel_id} comps={len(comps)} content={content[:80]!r}"
             )
                 # confirmation
             if self.pending_claim["triggered"]:
@@ -819,48 +718,32 @@ class SofiBotManager:
                     self.pending_claim["triggered"] = False
                     return
 
-            # --- Collect image URLs from attachments + embeds ---
-            img_urls = []
-
-            # 1) Attachments (old behavior)
-            for a in atts:
-                fn  = (a.get("filename", "") or "").lower()
-                url = a.get("url")
-                if url and any(fn.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp")):
-                    img_urls.append(url)
-
-            # 2) Embeds: image + thumbnail
-            for e in embeds:
-                img = e.get("image") or {}
-                url = img.get("url")
-                if url:
-                    img_urls.append(url)
-
-                thumb = e.get("thumbnail") or {}
-                turl = thumb.get("url")
-                if turl:
-                    img_urls.append(turl)
-
-            # Require buttons + at least one image URL
-            if not comps or not img_urls:
+            if not comps:
+                logging.info(f"[sofi-drop] no components; skip. content={content[:120]!r}")
                 return
-            # Mark that we *saw* a Sofi drop with components+image
+            cards = parse_cards_from_message(content)
+            if not cards:
+                logging.info(f"[sofi-drop] no cards parsed; skip. content={content[:200]!r}")
+                return
+
+            # Mark that we *saw* a Sofi drop with components+message
             self.last_sofi_drop_ts = time.time()
+            logging.info(f"[sofi-drop] seen: comps={len(comps)} cards={len(cards)}")
 
-            logging.info(f"🎴 Sofi drop seen: comps={len(comps)} imgs={len(img_urls)}")
-
-            def worker(url):
-                pil = pil_from_url(self.http, url)
-                if not pil:
-                    return
+            def worker():
                 try:
-                    self._pick_from_image(pil, comps, channel_id, guild_id, m)
+                    self._pick_from_message(cards, comps, channel_id, guild_id, m)
                 except Exception as e:
                     logging.warning(f"process drop error: {e}")
 
-            # Limit to first 3 images (3 cards)
-            for url in img_urls[:3]:
-                threading.Thread(target=worker, args=(url,), daemon=True).start()
+            for i in sorted(cards.keys()):
+                info = cards[i]
+                logging.info(
+                    f"[sofi-card] {i+1}: gen={info.get('min_gen') if info.get('min_gen') is not None else 'none'}, "
+                    f"Name='{info.get('name')}', Series='{info.get('series')}'"
+                )
+
+            threading.Thread(target=worker, daemon=True).start()
 
     # ---------- buttons & claims ----------
     def _btn_click(self, button_id, channel_id, guild_id, m, tag=""):
@@ -923,7 +806,7 @@ class SofiBotManager:
         label = (btn.get("label") or "").strip()
         return any(h in label for h in YELLOW_HEARTS)
 
-    def _pick_from_image(self, img: Image.Image, components, channel_id, guild_id, m):
+    def _pick_from_message(self, cards: Dict[int, dict], components, channel_id, guild_id, m):
         # parse buttons (ignore links; ignore beyond first 3)
         pos_btns = []
         for row in components:
@@ -945,12 +828,17 @@ class SofiBotManager:
 
         pos_btns = pos_btns[:3]
         if not pos_btns:
-            logging.warning("No claimable buttons found."); return
+            logging.warning("[sofi-pick] no claimable buttons found.")
+            return
+
+        for i, b in enumerate(pos_btns, start=1):
+            logging.info(
+                f"[sofi-btn] {i}: likes={b['likes']}, elite={b['elite']}, "
+                f"label={b['label']!r}, id={b['id'][:8]}..."
+            )
 
         acorn_pos  = [i for i,b in enumerate(pos_btns) if b["likes"] is None]
         normal_pos = [i for i,b in enumerate(pos_btns) if b["likes"] is not None]
-
-        cards = extract_cards(img)
 
         # 1) acorns first (claim all), non-blocking
         acorn_clicked = False
@@ -963,7 +851,7 @@ class SofiBotManager:
                 logging.warning(f"acorn click failed pos {p+1}: {e}")
 
         if not normal_pos:
-            logging.info("🌰 All buttons are acorns — done.")
+            logging.info("[sofi-pick] all buttons are acorns; done.")
             return
 
         if acorn_clicked:
@@ -973,16 +861,21 @@ class SofiBotManager:
         cands = []
         for i in normal_pos:
             info = cards.get(i, {})
-            gens = info.get("generations",{}) or {}
-            min_gen = min(gens.values()) if gens else None
+            min_gen = info.get("min_gen")
             cands.append({
                 "pos": i,
                 "likes": pos_btns[i]["likes"] or 0,
                 "min_gen": min_gen,
-                "has_gen": bool(gens),
+                "has_gen": bool(info.get("has_gen")),
                 "series": info.get("series","") or "",
                 "elite": bool(pos_btns[i].get("elite", False)),
             })
+        for c in cands:
+            logging.info(
+                f"[sofi-cand] pos={c['pos']+1} likes={c['likes']} "
+                f"gen={c['min_gen'] if c['min_gen'] is not None else 'none'} "
+                f"elite={c['elite']} series={c['series']!r}"
+            )
 
         # 2) ELITE
         e = next((c for c in cands if c["elite"]), None)
@@ -1021,7 +914,7 @@ class SofiBotManager:
             def score(c):
                 # likes (log damped by default)
                 if max_likes>0:
-                    like_norm = (np.log1p(c["likes"])/max(1e-9, np.log1p(max_likes))) if self.LIKES_LOG_DAMP else (c["likes"]/max_likes)
+                    like_norm = (math.log1p(c["likes"])/max(1e-9, math.log1p(max_likes))) if self.LIKES_LOG_DAMP else (c["likes"]/max_likes)
                 else:
                     like_norm = 0.0
                 if (c["min_gen"] is None or min_gen is None or max_gen is None or max_gen==min_gen):
