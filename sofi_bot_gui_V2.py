@@ -12,6 +12,15 @@ from typing import Optional, Dict
 import discum
 from dotenv import load_dotenv
 
+# Ensure SSL certificates resolve when frozen (PyInstaller)
+if getattr(sys, "frozen", False):
+    try:
+        import certifi
+        os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+    except Exception:
+        pass
+
 # UI
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -38,7 +47,8 @@ except Exception:
     HAVE_SELENIUM = False
 
 # ---------------- logging ----------------
-LOG_FILE = "Sofi_bot.log"
+BASE_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(BASE_DIR, "Sofi_bot.log")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -508,6 +518,7 @@ class SofiBotManager:
         self.raid_move_index = 0
         self._raid_lock = threading.Lock()
         self._raid_last_action = None
+        self.raid_start_ts = 0.0
         self.first_claim_made = False
         self._sgr_wait_log_at = 0.0
         self.first_cooldown_seen = False
@@ -661,6 +672,7 @@ class SofiBotManager:
                         self.raid_step = "start1"
                         self.raid_move_index = 0
                         self._raid_last_action = None
+                        self.raid_start_ts = time.time()
                 except Exception as e:
                     logging.warning(f"sgr send error: {e}")
                     self.sd_paused.clear()
@@ -959,6 +971,19 @@ class SofiBotManager:
                 return True
         return False
 
+    def _end_raid(self, reason: str):
+        with self._raid_lock:
+            self.raid_active = False
+            self.raid_step = "idle"
+            self.raid_move_index = 0
+            self._raid_last_action = None
+            self.raid_start_ts = 0.0
+        self.sd_paused.clear()
+        self.next_sd_at = time.time() + float(self.SD_INTERVAL) + random.uniform(0, self.SD_JITTER_SEC)
+        wait = max(60.0, self.SGR_INTERVAL_H * 3600.0) + random.uniform(0.0, self.SGR_JITTER_SEC)
+        self.next_sgr_at = time.time() + wait
+        logging.info(f"[raid] {reason}. next sgr in {wait:.0f}s.")
+
     def _handle_raid_message(self, content, embeds, components, channel_id, guild_id, m) -> bool:
         has_raid_ui = any(
             k in (content or "").lower()
@@ -970,20 +995,15 @@ class SofiBotManager:
             return False
 
         if self._raid_ended(content, embeds):
-            with self._raid_lock:
-                self.raid_active = False
-                self.raid_step = "idle"
-                self.raid_move_index = 0
-                self._raid_last_action = None
-            self.sd_paused.clear()
-            self.next_sd_at = time.time() + 5.0
-            wait = max(60.0, self.SGR_INTERVAL_H * 3600.0) + random.uniform(0.0, self.SGR_JITTER_SEC)
-            self.next_sgr_at = time.time() + wait
-            logging.info("[raid] ended; sd resumed.")
+            self._end_raid("ended")
             return True
 
         if not self.raid_active:
             return False
+
+        if self.raid_start_ts and (time.time() - self.raid_start_ts) > 420.0:
+            self._end_raid("failed (timeout > 7m)")
+            return True
 
         if not components:
             if embeds:
@@ -1004,19 +1024,23 @@ class SofiBotManager:
                 return True
 
             def worker():
-                self._sleep_human(self.RAID_STEP_DELAY)
-                self._btn_click(btn_start["custom_id"], channel_id, guild_id, m, tag="[raid] click Start Raid")
-                with self._raid_lock:
-                    self._raid_last_action = action_key
-                    if self.raid_step == "start1":
-                        self.raid_step = "start2"
-                    elif self.raid_step == "start2":
-                        self.raid_step = "moves"
+                try:
+                    self._sleep_human(self.RAID_STEP_DELAY)
+                    self._btn_click(btn_start["custom_id"], channel_id, guild_id, m, tag="[raid] click Start Raid")
+                    with self._raid_lock:
+                        self._raid_last_action = action_key
+                        if self.raid_step == "start1":
+                            self.raid_step = "start2"
+                        elif self.raid_step == "start2":
+                            self.raid_step = "moves"
+                except Exception as e:
+                    self._end_raid(f"failed (start click error: {e})")
 
             threading.Thread(target=worker, daemon=True).start()
             return True
         if self.raid_step in ("start1", "start2") and not btn_start:
             self._log_components(components, "start button not found")
+            self._end_raid("failed (start button missing)")
             return True
 
         if self.raid_step == "moves" and menu and btn_apply:
@@ -1033,18 +1057,22 @@ class SofiBotManager:
                 return True
 
             def worker():
-                self._sleep_human(self.RAID_STEP_DELAY)
-                self._select_menu(menu["custom_id"], value, channel_id, guild_id, m, tag=f"[raid] select {label}")
-                self._sleep_human(self.RAID_STEP_DELAY)
-                self._btn_click(btn_apply["custom_id"], channel_id, guild_id, m, tag=f"[raid] apply {label}")
-                with self._raid_lock:
-                    self._raid_last_action = action_key
-                    self.raid_move_index += 1
+                try:
+                    self._sleep_human(self.RAID_STEP_DELAY)
+                    self._select_menu(menu["custom_id"], value, channel_id, guild_id, m, tag=f"[raid] select {label}")
+                    self._sleep_human(self.RAID_STEP_DELAY)
+                    self._btn_click(btn_apply["custom_id"], channel_id, guild_id, m, tag=f"[raid] apply {label}")
+                    with self._raid_lock:
+                        self._raid_last_action = action_key
+                        self.raid_move_index += 1
+                except Exception as e:
+                    self._end_raid(f"failed (move/apply error: {e})")
 
             threading.Thread(target=worker, daemon=True).start()
             return True
         if self.raid_step == "moves" and (not menu or not btn_apply):
             self._log_components(components, "moves menu/apply not found")
+            self._end_raid("failed (moves menu/apply not found)")
             return True
 
         return True
@@ -1272,6 +1300,7 @@ class SofiGUI:
         self._build_ui()
         self._wire_logging()
         self._load_from_env()
+        logging.info("GUI initialized.")
         self.root.after(150, self._start_now)
 
         # Bind kill signals
