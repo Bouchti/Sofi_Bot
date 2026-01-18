@@ -519,9 +519,13 @@ class SofiBotManager:
         self._raid_lock = threading.Lock()
         self._raid_last_action = None
         self.raid_start_ts = 0.0
+        self.raid_msg_id = None
         self.first_claim_made = False
         self._sgr_wait_log_at = 0.0
         self.first_cooldown_seen = False
+        self.raid_waiting_for_claim = False
+        self.raid_due_sd_ts = 0.0
+        self.raid_ready_to_send = False
         # reboot guard
         self._reboot_lock = threading.Lock()
         self._last_reboot = 0.0
@@ -662,9 +666,22 @@ class SofiBotManager:
 
             now = time.time()
             if now >= self.next_sgr_at and not self.raid_active:
+                if self.raid_waiting_for_claim:
+                    if now - self._sgr_wait_log_at > 10.0:
+                        logging.info("[raid] waiting for next sd+claim before sgr.")
+                        self._sgr_wait_log_at = now
+                    self.stop_evt.wait(1.0)
+                    continue
+
+                if not self.raid_ready_to_send:
+                    self.raid_waiting_for_claim = True
+                    self.raid_due_sd_ts = self.last_sd_sent_ts
+                    logging.info("[raid] sgr window reached; waiting for next sd+claim.")
+                    self.stop_evt.wait(1.0)
+                    continue
+
+            if now >= self.next_sgr_at and not self.raid_active and self.raid_ready_to_send:
                 try:
-                    self.sd_paused.set()
-                    self.next_sd_at = time.time() + 5.0
                     self.bot.sendMessage(self.CHANNEL, "sgr")
                     logging.info("📤 sent 'sgr' (raid)")
                     with self._raid_lock:
@@ -675,8 +692,8 @@ class SofiBotManager:
                         self.raid_start_ts = time.time()
                 except Exception as e:
                     logging.warning(f"sgr send error: {e}")
-                    self.sd_paused.clear()
 
+                self.raid_ready_to_send = False
                 wait = max(60.0, self.SGR_INTERVAL_H * 3600.0) + random.uniform(0.0, self.SGR_JITTER_SEC)
                 self.next_sgr_at = time.time() + wait
 
@@ -816,7 +833,16 @@ class SofiBotManager:
                         self.first_claim_made = True
                         if self.next_sgr_at <= 0 and not self.raid_active:
                             self.next_sgr_at = time.time()
+                            self.raid_ready_to_send = True
                             logging.info("[raid] first claim seen; sending sgr now.")
+                    if self.raid_waiting_for_claim and not self.raid_active:
+                        if self.last_sd_sent_ts > self.raid_due_sd_ts:
+                            self.raid_waiting_for_claim = False
+                            self.next_sgr_at = time.time()
+                            self.raid_ready_to_send = True
+                            logging.info("[raid] claim after sd; sending sgr now.")
+                        else:
+                            logging.info("[raid] claim seen but no sd since sgr due; waiting.")
                     return
 
             if self._handle_raid_message(content, embeds, comps, channel_id, guild_id, m):
@@ -912,8 +938,11 @@ class SofiBotManager:
 
     def _iter_components(self, components):
         for row in components:
-            for comp in row.get("components", []):
-                yield comp
+            if "components" in row:
+                for comp in row.get("components", []):
+                    yield comp
+            else:
+                yield row
 
     def _find_button(self, components, label_contains: str):
         target = (label_contains or "").lower()
@@ -978,7 +1007,10 @@ class SofiBotManager:
             self.raid_move_index = 0
             self._raid_last_action = None
             self.raid_start_ts = 0.0
-        self.sd_paused.clear()
+            self.raid_msg_id = None
+        self.raid_waiting_for_claim = False
+        self.raid_due_sd_ts = 0.0
+        self.raid_ready_to_send = False
         self.next_sd_at = time.time() + float(self.SD_INTERVAL) + random.uniform(0, self.SD_JITTER_SEC)
         wait = max(60.0, self.SGR_INTERVAL_H * 3600.0) + random.uniform(0.0, self.SGR_JITTER_SEC)
         self.next_sgr_at = time.time() + wait
@@ -1014,6 +1046,10 @@ class SofiBotManager:
             return True
 
         msg_id = m.get("id")
+        if has_raid_ui:
+            self.raid_msg_id = msg_id
+        elif self.raid_msg_id and msg_id != self.raid_msg_id:
+            return False
         btn_start = self._find_button(components, "start raid")
         btn_apply = self._find_button(components, "apply")
         menu = self._find_select(components)
@@ -1045,13 +1081,39 @@ class SofiBotManager:
 
         if self.raid_step == "moves" and menu and btn_apply:
             options = menu.get("options", []) or []
-            options = [o for o in options if "refresh" not in (o.get("label") or "").lower()]
+            def _is_refresh(opt):
+                label = (opt.get("label") or "").lower()
+                value = (opt.get("value") or "").lower()
+                desc = (opt.get("description") or "").lower()
+                return "refresh" in label or "refresh" in value or "refresh" in desc
+            has_refresh = any(_is_refresh(o) for o in options)
+            options = [o for o in options if not _is_refresh(o)]
             if not options:
                 return True
-            idx = self.raid_move_index % len(options)
-            opt = options[idx]
+            opt = None
+            if has_refresh:
+                logging.info(
+                    "[raid] refresh detected; options=%s",
+                    [
+                        {
+                            "label": o.get("label"),
+                            "value": o.get("value"),
+                            "description": o.get("description"),
+                        }
+                        for o in options
+                    ],
+                )
+                for o in options:
+                    label = (o.get("label") or "").lower()
+                    value = (o.get("value") or "").lower()
+                    if "sofi special" in label or "sofi special" in value:
+                        opt = o
+                        break
+            if opt is None:
+                idx = self.raid_move_index % len(options)
+                opt = options[idx]
             value = opt.get("value")
-            label = opt.get("label") or f"move-{idx+1}"
+            label = opt.get("label") or "move"
             action_key = ("move", msg_id, self.raid_move_index)
             if not value or self._raid_last_action == action_key:
                 return True
